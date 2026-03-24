@@ -1,19 +1,40 @@
 import os
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
+from typing import Tuple, Dict
 
 
 @dataclass
 class Config:
-    DATA_ROOT: str = "../dat/BSDS300/images/test"
-    SAVE_ROOT: str = "../res/variability_simulation"
+    # ---------------------------------------------------------
+    # Paths
+    # ---------------------------------------------------------
+    TRAIN_ROOT: str = "../dat/BSDS300/images/train"
+    TEST_ROOT: str = "../dat/BSDS300/images/test"
+    SAVE_ROOT: str = "../res/attention_guided_zone_selection"
 
+    # ---------------------------------------------------------
+    # Data
+    # ---------------------------------------------------------
     IMAGE_SIZE: Tuple[int, int] = (256, 256)
-    MAX_IMAGES: int = 30
+    MAX_TRAIN_IMAGES: int | None = None
+    MAX_TEST_IMAGES: int | None = None
+    VAL_RATIO: float = 0.15
     FILE_EXTENSIONS: Tuple[str, ...] = (".jpg", ".jpeg", ".png", ".bmp")
 
+    # ---------------------------------------------------------
+    # Training
+    # ---------------------------------------------------------
     SEED: int = 42
+    DEVICE: str = "cuda"
+    BATCH_SIZE: int = 8
+    EPOCHS: int = 40
+    LR: float = 1e-3
+    NUM_WORKERS: int = 0
+    WEIGHT_DECAY: float = 1e-5
 
+    # ---------------------------------------------------------
+    # Synthetic variability for observed image generation
+    # ---------------------------------------------------------
     MAP_MODE: str = "radial"   # "radial" or "blocky"
     RADIAL_CENTER: Tuple[float, float] = (0.5, 0.5)
     RADIAL_FALLOFF: float = 1.6
@@ -24,24 +45,50 @@ class Config:
     NOISE_SIGMA_MIN: float = 0.01
     NOISE_SIGMA_ALPHA: float = 0.08
 
-    THRESH_HIGH: float = 0.78
-    THRESH_MID: float = 0.58
-
+    # ---------------------------------------------------------
+    # Kernel setup
+    # zone order: 0=attention, 1=intermediate, 2=around
+    # ---------------------------------------------------------
     KERNEL_SIZE: int = 3
-    GLOBAL_SIGMA: float = 1.0
-    GLOBAL_SIGMA_CANDIDATES: Tuple[float, ...] = (0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 1.8, 2.2)
+    GLOBAL_SIGMA_CANDIDATES: Tuple[float, ...] = (0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 1.8)
 
-    REGION_SIGMAS: Dict[int, float] = field(
+    ZONE_KERNEL_SPECS: Dict[int, dict] = field(
         default_factory=lambda: {
-            0: 0.5,
-            1: 1.0,
-            2: 1.8,
+            0: {"family": "unsharp", "sigma": 0.9, "amount": 0.45},   # attention
+            1: {"family": "binomial"},                                # intermediate
+            2: {"family": "gaussian", "sigma": 1.6},                  # around
         }
     )
 
-    SAVE_INDIVIDUAL_IMAGES: bool = True
+    # ---------------------------------------------------------
+    # Saliency -> zone
+    # ---------------------------------------------------------
+    SAL_LOW: float = 0.35
+    SAL_HIGH: float = 0.65
+    SOFT_TEMP: float = 0.08
+
+    # desired average zone ratios for regularization
+    # attention / intermediate / around
+    TARGET_ZONE_RATIOS: Tuple[float, float, float] = (0.15, 0.25, 0.60)
+
+    # ---------------------------------------------------------
+    # Loss weights
+    # ---------------------------------------------------------
+    LOSS_W_L1: float = 0.70
+    LOSS_W_GRAD: float = 0.30
+    LOSS_W_TV: float = 0.02
+    LOSS_W_RATIO: float = 0.05
+
+    # model selection score: 0.7*L1 + 0.3*Grad
+    SELECT_W_L1: float = 0.70
+    SELECT_W_GRAD: float = 0.30
+
+    # ---------------------------------------------------------
+    # Save
+    # ---------------------------------------------------------
     SAVE_PANELS: bool = True
-    SAVE_SUMMARY_PLOTS: bool = True
+    SAVE_INDIVIDUAL_IMAGES: bool = True
+    SAVE_MAX_PANELS: int = 8
 
 
 CFG = Config()

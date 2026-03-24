@@ -1,25 +1,149 @@
 import os
 import csv
+import copy
 import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from sklearn.model_selection import train_test_split
 
 from config import CFG
-from utils import set_seed, ensure_dir
-from dataset import load_dataset
-from variability import generate_variability_map, generate_observed_image, generate_region_map
-from collections import Counter
-from filters import apply_pdk_filter, search_best_global_sigma, gaussian_kernel
-from metrics import (
-    compute_mse,
-    compute_psnr,
-    compute_ssim,
-    compute_regionwise_mse,
-    compute_gradient_error,
+from utils import set_seed, ensure_dir, device_string
+from dataset import list_image_files, BSDSAttentionDataset
+from filters import (
+    get_zone_kernel_bank,
+    apply_kernel_bank_soft,
+    apply_kernel_bank_hard,
+    apply_global_gaussian,
+    gaussian_kernel_np,
 )
-from visualize import save_image, save_region_map, save_panel, save_summary_barplot
+from attention_net import AttentionZoneNet, saliency_to_soft_zones, saliency_to_hard_zones
+from losses import total_train_loss, reconstruction_loss, selection_score_from_losses
+from metrics import compute_metrics_np
+from visualize import save_image, save_zone_map, save_attention_panel, save_barplot
 
 
-def main():
-    set_seed(CFG.SEED)
+def to_numpy_img(x: torch.Tensor) -> np.ndarray:
+    return x.detach().cpu().squeeze().numpy().astype(np.float32)
+
+
+def build_loaders():
+    train_paths = list_image_files(CFG.TRAIN_ROOT, max_images=CFG.MAX_TRAIN_IMAGES)
+    test_paths = list_image_files(CFG.TEST_ROOT, max_images=CFG.MAX_TEST_IMAGES)
+
+    if len(train_paths) < 2:
+        raise RuntimeError("Need at least 2 training images.")
+
+    tr_paths, val_paths = train_test_split(
+        train_paths,
+        test_size=CFG.VAL_RATIO,
+        random_state=CFG.SEED,
+        shuffle=True,
+    )
+
+    train_ds = BSDSAttentionDataset(tr_paths, CFG.IMAGE_SIZE, base_seed=CFG.SEED * 10 + 1)
+    val_ds = BSDSAttentionDataset(val_paths, CFG.IMAGE_SIZE, base_seed=CFG.SEED * 10 + 2)
+    test_ds = BSDSAttentionDataset(test_paths, CFG.IMAGE_SIZE, base_seed=CFG.SEED * 10 + 3)
+
+    train_loader = DataLoader(train_ds, batch_size=CFG.BATCH_SIZE, shuffle=True, num_workers=CFG.NUM_WORKERS)
+    val_loader = DataLoader(val_ds, batch_size=CFG.BATCH_SIZE, shuffle=False, num_workers=CFG.NUM_WORKERS)
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=CFG.NUM_WORKERS)
+
+    return train_loader, val_loader, test_loader
+
+
+@torch.no_grad()
+def select_best_global_sigma(val_loader, device):
+    rows = []
+    for sigma in CFG.GLOBAL_SIGMA_CANDIDATES:
+        l1_list = []
+        grad_list = []
+        for batch in val_loader:
+            observed = batch["observed"].to(device)
+            clean = batch["clean"].to(device)
+
+            pred = apply_global_gaussian(observed, sigma=sigma)
+            rec = reconstruction_loss(pred, clean)
+
+            l1_list.append(float(rec["l1"].detach().cpu()))
+            grad_list.append(float(rec["grad"].detach().cpu()))
+
+        mean_l1 = float(np.mean(l1_list))
+        mean_grad = float(np.mean(grad_list))
+        score = selection_score_from_losses(mean_l1, mean_grad)
+
+        rows.append({
+            "sigma": float(sigma),
+            "l1": mean_l1,
+            "grad": mean_grad,
+            "score": score,
+        })
+
+    best_row = min(rows, key=lambda x: x["score"])
+    return best_row, rows
+
+
+def train_one_epoch(model, loader, optimizer, kernel_bank, device):
+    model.train()
+    logs = []
+
+    for batch in loader:
+        observed = batch["observed"].to(device)
+        clean = batch["clean"].to(device)
+
+        optimizer.zero_grad()
+
+        saliency = model(observed)
+        zone_probs = saliency_to_soft_zones(
+            saliency,
+            low=CFG.SAL_LOW,
+            high=CFG.SAL_HIGH,
+            temp=CFG.SOFT_TEMP,
+        )
+        pred = apply_kernel_bank_soft(observed, zone_probs, kernel_bank)
+
+        loss, log = total_train_loss(pred, clean, saliency, zone_probs)
+        loss.backward()
+        optimizer.step()
+
+        logs.append(log)
+
+    mean_log = {k: float(np.mean([x[k] for x in logs])) for k in logs[0].keys()}
+    return mean_log
+
+
+@torch.no_grad()
+def validate(model, loader, kernel_bank, device):
+    model.eval()
+
+    total_l1 = []
+    total_grad = []
+
+    for batch in loader:
+        observed = batch["observed"].to(device)
+        clean = batch["clean"].to(device)
+
+        saliency = model(observed)
+        zone_map = saliency_to_hard_zones(saliency, low=CFG.SAL_LOW, high=CFG.SAL_HIGH)
+        pred = apply_kernel_bank_hard(observed, zone_map, kernel_bank)
+
+        rec = reconstruction_loss(pred, clean)
+        total_l1.append(float(rec["l1"].detach().cpu()))
+        total_grad.append(float(rec["grad"].detach().cpu()))
+
+    mean_l1 = float(np.mean(total_l1))
+    mean_grad = float(np.mean(total_grad))
+    score = selection_score_from_losses(mean_l1, mean_grad)
+
+    return {
+        "l1": mean_l1,
+        "grad": mean_grad,
+        "score": score,
+    }
+
+
+@torch.no_grad()
+def evaluate_test(model, test_loader, kernel_bank, global_sigma, device):
+    model.eval()
 
     img_dir = os.path.join(CFG.SAVE_ROOT, "images")
     panel_dir = os.path.join(CFG.SAVE_ROOT, "panels")
@@ -28,168 +152,208 @@ def main():
     ensure_dir(panel_dir)
     ensure_dir(plot_dir)
 
-    dataset = load_dataset()
-    if len(dataset) == 0:
-        raise RuntimeError(f"No images found in {CFG.DATA_ROOT}")
+    rows = []
 
-    all_rows = []
+    psnr_obs = []
+    psnr_global = []
+    psnr_pdk = []
 
-    psnr_obs_list, psnr_global_list, psnr_pdk_list = [], [], []
-    ssim_obs_list, ssim_global_list, ssim_pdk_list = [], [], []
-    grad_obs_list, grad_global_list, grad_pdk_list = [], [], []
+    ssim_obs = []
+    ssim_global = []
+    ssim_pdk = []
 
-    region_global_accum = {0: [], 1: [], 2: []}
-    region_pdk_accum = {0: [], 1: [], 2: []}
-    region_obs_accum = {0: [], 1: [], 2: []}
+    grad_obs = []
+    grad_global = []
+    grad_pdk = []
 
-    best_sigma_list = []
+    for idx, batch in enumerate(test_loader):
+        name = batch["name"][0]
+        observed = batch["observed"].to(device)
+        clean = batch["clean"].to(device)
 
-    for idx, (name, clean) in enumerate(dataset):
-        h, w = clean.shape
+        saliency = model(observed)
+        zone_map = saliency_to_hard_zones(saliency, low=CFG.SAL_LOW, high=CFG.SAL_HIGH)
 
-        v_map = generate_variability_map(h, w, mode=CFG.MAP_MODE)
-        observed, noise_sigma_map = generate_observed_image(clean, v_map)
-        region_map = generate_region_map(v_map)
+        out_global = apply_global_gaussian(observed, sigma=global_sigma)
+        out_pdk = apply_kernel_bank_hard(observed, zone_map, kernel_bank)
 
-        best_sigma, global_out, _ = search_best_global_sigma(
-            observed=observed,
-            clean=clean,
-            sigma_candidates=list(CFG.GLOBAL_SIGMA_CANDIDATES),
-            kernel_size=CFG.KERNEL_SIZE,
-        )
-        pdk_out = apply_pdk_filter(observed, region_map)
+        clean_np = to_numpy_img(clean)
+        observed_np = to_numpy_img(observed)
+        saliency_np = to_numpy_img(saliency)
+        zone_map_np = zone_map.detach().cpu().squeeze().numpy().astype(np.int32)
+        global_np = to_numpy_img(out_global)
+        pdk_np = to_numpy_img(out_pdk)
 
-        mse_obs = compute_mse(observed, clean)
-        mse_global = compute_mse(global_out, clean)
-        mse_pdk = compute_mse(pdk_out, clean)
+        m_obs = compute_metrics_np(observed_np, clean_np)
+        m_global = compute_metrics_np(global_np, clean_np)
+        m_pdk = compute_metrics_np(pdk_np, clean_np)
 
-        psnr_obs = compute_psnr(observed, clean)
-        psnr_global = compute_psnr(global_out, clean)
-        psnr_pdk = compute_psnr(pdk_out, clean)
-
-        ssim_obs = compute_ssim(observed, clean)
-        ssim_global = compute_ssim(global_out, clean)
-        ssim_pdk = compute_ssim(pdk_out, clean)
-
-        grad_obs = compute_gradient_error(observed, clean)
-        grad_global = compute_gradient_error(global_out, clean)
-        grad_pdk = compute_gradient_error(pdk_out, clean)
-
-        reg_obs = compute_regionwise_mse(observed, clean, region_map)
-        reg_global = compute_regionwise_mse(global_out, clean, region_map)
-        reg_pdk = compute_regionwise_mse(pdk_out, clean, region_map)
-
-        best_sigma_list.append(best_sigma)
-
-        psnr_obs_list.append(psnr_obs)
-        psnr_global_list.append(psnr_global)
-        psnr_pdk_list.append(psnr_pdk)
-
-        ssim_obs_list.append(ssim_obs)
-        ssim_global_list.append(ssim_global)
-        ssim_pdk_list.append(ssim_pdk)
-
-        grad_obs_list.append(grad_obs)
-        grad_global_list.append(grad_global)
-        grad_pdk_list.append(grad_pdk)
-
-        for rid in [0, 1, 2]:
-            region_obs_accum[rid].append(reg_obs[rid])
-            region_global_accum[rid].append(reg_global[rid])
-            region_pdk_accum[rid].append(reg_pdk[rid])
-
-        row = {
+        rows.append({
             "name": name,
-            "best_global_sigma": best_sigma,
-            "mse_observed": mse_obs,
-            "mse_global": mse_global,
-            "mse_pdk": mse_pdk,
-            "psnr_observed": psnr_obs,
-            "psnr_global": psnr_global,
-            "psnr_pdk": psnr_pdk,
-            "ssim_observed": ssim_obs,
-            "ssim_global": ssim_global,
-            "ssim_pdk": ssim_pdk,
-            "grad_observed": grad_obs,
-            "grad_global": grad_global,
-            "grad_pdk": grad_pdk,
-            "region0_obs": reg_obs[0],
-            "region1_obs": reg_obs[1],
-            "region2_obs": reg_obs[2],
-            "region0_global": reg_global[0],
-            "region1_global": reg_global[1],
-            "region2_global": reg_global[2],
-            "region0_pdk": reg_pdk[0],
-            "region1_pdk": reg_pdk[1],
-            "region2_pdk": reg_pdk[2],
-        }
-        all_rows.append(row)
+            "psnr_observed": m_obs["psnr"],
+            "psnr_global": m_global["psnr"],
+            "psnr_pdk": m_pdk["psnr"],
+            "ssim_observed": m_obs["ssim"],
+            "ssim_global": m_global["ssim"],
+            "ssim_pdk": m_pdk["ssim"],
+            "grad_observed": m_obs["grad"],
+            "grad_global": m_global["grad"],
+            "grad_pdk": m_pdk["grad"],
+            "l1_observed": m_obs["l1"],
+            "l1_global": m_global["l1"],
+            "l1_pdk": m_pdk["l1"],
+            "mse_observed": m_obs["mse"],
+            "mse_global": m_global["mse"],
+            "mse_pdk": m_pdk["mse"],
+        })
+
+        psnr_obs.append(m_obs["psnr"])
+        psnr_global.append(m_global["psnr"])
+        psnr_pdk.append(m_pdk["psnr"])
+
+        ssim_obs.append(m_obs["ssim"])
+        ssim_global.append(m_global["ssim"])
+        ssim_pdk.append(m_pdk["ssim"])
+
+        grad_obs.append(m_obs["grad"])
+        grad_global.append(m_global["grad"])
+        grad_pdk.append(m_pdk["grad"])
 
         if CFG.SAVE_INDIVIDUAL_IMAGES:
-            save_image(os.path.join(img_dir, f"{name}_clean.png"), clean)
-            save_image(os.path.join(img_dir, f"{name}_observed.png"), observed)
-            save_image(os.path.join(img_dir, f"{name}_vmap.png"), v_map, cmap="magma")
-            save_region_map(os.path.join(img_dir, f"{name}_regionmap.png"), region_map)
-            save_image(os.path.join(img_dir, f"{name}_global.png"), global_out)
-            save_image(os.path.join(img_dir, f"{name}_pdk.png"), pdk_out)
+            save_image(os.path.join(img_dir, f"{name}_clean.png"), clean_np)
+            save_image(os.path.join(img_dir, f"{name}_observed.png"), observed_np)
+            save_image(os.path.join(img_dir, f"{name}_saliency.png"), saliency_np, cmap="magma")
+            save_zone_map(os.path.join(img_dir, f"{name}_zones.png"), zone_map_np)
+            save_image(os.path.join(img_dir, f"{name}_global.png"), global_np)
+            save_image(os.path.join(img_dir, f"{name}_pdk.png"), pdk_np)
 
-        if CFG.SAVE_PANELS and idx < 8:
-            save_panel(
+        if CFG.SAVE_PANELS and idx < CFG.SAVE_MAX_PANELS:
+            save_attention_panel(
                 os.path.join(panel_dir, f"{name}_panel.png"),
-                clean=clean,
-                observed=observed,
-                global_out=global_out,
-                pdk_out=pdk_out,
-                v_map=v_map,
-                region_map=region_map,
+                clean=clean_np,
+                observed=observed_np,
+                global_out=global_np,
+                pdk_out=pdk_np,
+                saliency=saliency_np,
+                zone_map=zone_map_np,
             )
 
         print(
-            f"[{idx+1:02d}/{len(dataset):02d}] {name} | "
-            f"best global sigma={best_sigma:.2f} | "
-            f"PSNR obs/global/pdk = {psnr_obs:.3f} / {psnr_global:.3f} / {psnr_pdk:.3f}"
+            f"[{idx+1:02d}] {name} | "
+            f"PSNR obs/global/pdk = {m_obs['psnr']:.3f} / {m_global['psnr']:.3f} / {m_pdk['psnr']:.3f} | "
+            f"Grad obs/global/pdk = {m_obs['grad']:.5f} / {m_global['grad']:.5f} / {m_pdk['grad']:.5f}"
         )
 
-    csv_path = os.path.join(CFG.SAVE_ROOT, "metrics.csv")
+    csv_path = os.path.join(CFG.SAVE_ROOT, "metrics_test.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
-        writer.writerows(all_rows)
+        writer.writerows(rows)
 
     summary_psnr = {
-        "Observed": float(np.mean(psnr_obs_list)),
-        "Best Global": float(np.mean(psnr_global_list)),
-        "Ideal PDK": float(np.mean(psnr_pdk_list)),
+        "Observed": float(np.mean(psnr_obs)),
+        "Best Global": float(np.mean(psnr_global)),
+        "Attn-guided PDK": float(np.mean(psnr_pdk)),
     }
     summary_ssim = {
-        "Observed": float(np.mean(ssim_obs_list)),
-        "Best Global": float(np.mean(ssim_global_list)),
-        "Ideal PDK": float(np.mean(ssim_pdk_list)),
+        "Observed": float(np.mean(ssim_obs)),
+        "Best Global": float(np.mean(ssim_global)),
+        "Attn-guided PDK": float(np.mean(ssim_pdk)),
     }
     summary_grad = {
-        "Observed": float(np.mean(grad_obs_list)),
-        "Best Global": float(np.mean(grad_global_list)),
-        "Ideal PDK": float(np.mean(grad_pdk_list)),
+        "Observed": float(np.mean(grad_obs)),
+        "Best Global": float(np.mean(grad_global)),
+        "Attn-guided PDK": float(np.mean(grad_pdk)),
     }
 
-    if CFG.SAVE_SUMMARY_PLOTS:
-        save_summary_barplot(os.path.join(plot_dir, "psnr_summary.png"), summary_psnr, ylabel="PSNR (dB)")
-        save_summary_barplot(os.path.join(plot_dir, "ssim_summary.png"), summary_ssim, ylabel="SSIM")
-        save_summary_barplot(os.path.join(plot_dir, "gradient_error_summary.png"), summary_grad, ylabel="Gradient Error")
+    save_barplot(os.path.join(plot_dir, "psnr_summary.png"), summary_psnr, ylabel="PSNR (dB)")
+    save_barplot(os.path.join(plot_dir, "ssim_summary.png"), summary_ssim, ylabel="SSIM")
+    save_barplot(os.path.join(plot_dir, "gradient_summary.png"), summary_grad, ylabel="Gradient L1")
 
-    sigma_counter = Counter(best_sigma_list)
-    most_common_sigma, count = sigma_counter.most_common(1)[0]
-    most_common_kernel = gaussian_kernel(CFG.KERNEL_SIZE, most_common_sigma)
+    return summary_psnr, summary_ssim, summary_grad
 
-    print("\n=== Summary ===")
+
+def main():
+    set_seed(CFG.SEED)
+    device = device_string(CFG.DEVICE)
+
+    train_loader, val_loader, test_loader = build_loaders()
+    kernel_bank = get_zone_kernel_bank(device)
+
+    # ---------------------------------------------------------
+    # 1) Select best global sigma on validation
+    # ---------------------------------------------------------
+    best_global_row, all_global_rows = select_best_global_sigma(val_loader, device)
+    best_global_sigma = best_global_row["sigma"]
+    best_global_kernel = gaussian_kernel_np(CFG.KERNEL_SIZE, best_global_sigma)
+
+    print("\n=== Validation Global Search ===")
+    for row in all_global_rows:
+        print(
+            f"sigma={row['sigma']:.2f} | "
+            f"L1={row['l1']:.6f} | "
+            f"Grad={row['grad']:.6f} | "
+            f"Score={row['score']:.6f}"
+        )
+
+    print("\nSelected best global sigma:")
+    print(f"  sigma = {best_global_sigma:.3f}")
+    print(f"  kernel size = {CFG.KERNEL_SIZE}x{CFG.KERNEL_SIZE}")
+    print("  kernel =")
+    print(np.array2string(best_global_kernel, precision=4, suppress_small=True))
+
+    # ---------------------------------------------------------
+    # 2) Train attention-guided zone selector
+    # ---------------------------------------------------------
+    model = AttentionZoneNet(in_ch=1, base_ch=32).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=CFG.LR, weight_decay=CFG.WEIGHT_DECAY)
+
+    best_state = None
+    best_val_score = float("inf")
+    ckpt_path = os.path.join(CFG.SAVE_ROOT, "best_attention_model.pt")
+
+    for epoch in range(1, CFG.EPOCHS + 1):
+        train_log = train_one_epoch(model, train_loader, optimizer, kernel_bank, device)
+        val_log = validate(model, val_loader, kernel_bank, device)
+
+        print(
+            f"Epoch {epoch:03d} | "
+            f"Train total={train_log['total']:.5f}, l1={train_log['l1']:.5f}, grad={train_log['grad']:.5f}, "
+            f"tv={train_log['tv']:.5f}, ratio={train_log['ratio']:.5f} | "
+            f"Val l1={val_log['l1']:.5f}, grad={val_log['grad']:.5f}, score={val_log['score']:.5f}"
+        )
+
+        if val_log["score"] < best_val_score:
+            best_val_score = val_log["score"]
+            best_state = copy.deepcopy(model.state_dict())
+            torch.save({
+                "model_state_dict": best_state,
+                "val_score": best_val_score,
+                "best_global_sigma": best_global_sigma,
+            }, ckpt_path)
+
+    if best_state is None:
+        raise RuntimeError("Training failed: no checkpoint saved.")
+
+    model.load_state_dict(best_state)
+
+    # ---------------------------------------------------------
+    # 3) Test evaluation
+    # ---------------------------------------------------------
+    summary_psnr, summary_ssim, summary_grad = evaluate_test(
+        model=model,
+        test_loader=test_loader,
+        kernel_bank=kernel_bank,
+        global_sigma=best_global_sigma,
+        device=device,
+    )
+
+    print("\n=== Final Test Summary ===")
     print("PSNR:", summary_psnr)
     print("SSIM:", summary_ssim)
-    print("Gradient Error:", summary_grad)
-    print(f"Most common best global sigma: {most_common_sigma:.3f} (selected {count} times)")
-    print(f"Kernel size: {CFG.KERNEL_SIZE}x{CFG.KERNEL_SIZE}")
-    print("Gaussian kernel for most common best sigma:")
-    print(np.array2string(most_common_kernel, precision=4, suppress_small=True))
+    print("Gradient:", summary_grad)
     print(f"Saved to: {CFG.SAVE_ROOT}")
+    print(f"Checkpoint: {ckpt_path}")
 
 
 if __name__ == "__main__":

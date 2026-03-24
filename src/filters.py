@@ -1,12 +1,18 @@
 import numpy as np
-from scipy.ndimage import convolve
+import torch
+import torch.nn.functional as F
 
 from config import CFG
-from utils import clip01
 
 
-def gaussian_kernel(kernel_size: int, sigma: float) -> np.ndarray:
-    assert kernel_size % 2 == 1, "kernel_size must be odd"
+def identity_kernel(kernel_size: int) -> np.ndarray:
+    k = np.zeros((kernel_size, kernel_size), dtype=np.float32)
+    c = kernel_size // 2
+    k[c, c] = 1.0
+    return k
+
+
+def gaussian_kernel_np(kernel_size: int, sigma: float) -> np.ndarray:
     ax = np.arange(-(kernel_size // 2), kernel_size // 2 + 1, dtype=np.float32)
     xx, yy = np.meshgrid(ax, ax)
     kernel = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2 + 1e-12))
@@ -14,61 +20,92 @@ def gaussian_kernel(kernel_size: int, sigma: float) -> np.ndarray:
     return kernel.astype(np.float32)
 
 
-def apply_global_filter(img: np.ndarray, sigma: float = None, kernel_size: int = None) -> np.ndarray:
-    if sigma is None:
-        sigma = CFG.GLOBAL_SIGMA
+def binomial_kernel_np(kernel_size: int) -> np.ndarray:
+    order = kernel_size - 1
+    vec = np.array([1.0], dtype=np.float32)
+    for _ in range(order):
+        vec = np.convolve(vec, np.array([1.0, 1.0], dtype=np.float32)).astype(np.float32)
+    kernel = np.outer(vec, vec)
+    kernel /= kernel.sum() + 1e-12
+    return kernel.astype(np.float32)
+
+
+def unsharp_kernel_np(kernel_size: int, sigma: float, amount: float) -> np.ndarray:
+    delta = identity_kernel(kernel_size)
+    blur = gaussian_kernel_np(kernel_size, sigma)
+    kernel = delta + amount * (delta - blur)
+    return kernel.astype(np.float32)
+
+
+def build_kernel_np(spec: dict, kernel_size: int | None = None) -> np.ndarray:
     if kernel_size is None:
         kernel_size = CFG.KERNEL_SIZE
 
-    kernel = gaussian_kernel(kernel_size, sigma)
-    out = convolve(img, kernel, mode="reflect")
-    return clip01(out)
+    family = spec["family"]
+    if family == "gaussian":
+        return gaussian_kernel_np(kernel_size, sigma=float(spec["sigma"]))
+    if family == "binomial":
+        return binomial_kernel_np(kernel_size)
+    if family == "unsharp":
+        return unsharp_kernel_np(kernel_size, sigma=float(spec["sigma"]), amount=float(spec["amount"]))
+    raise ValueError(f"Unknown kernel family: {family}")
 
 
-def search_best_global_sigma(
-    observed: np.ndarray,
-    clean: np.ndarray,
-    sigma_candidates: list[float],
-    kernel_size: int = None,
-) -> tuple[float, np.ndarray, float]:
-    if kernel_size is None:
-        kernel_size = CFG.KERNEL_SIZE
-
-    best_sigma = None
-    best_out = None
-    best_mse = float("inf")
-
-    for sigma in sigma_candidates:
-        out = apply_global_filter(observed, sigma=sigma, kernel_size=kernel_size)
-        mse = float(np.mean((out - clean) ** 2))
-        if mse < best_mse:
-            best_mse = mse
-            best_sigma = sigma
-            best_out = out
-
-    return best_sigma, best_out, best_mse
+def get_zone_kernel_bank(device: str) -> torch.Tensor:
+    """
+    zone order: 0=attention, 1=intermediate, 2=around
+    return shape [3,1,K,K]
+    """
+    kernels = []
+    for zone_id in [0, 1, 2]:
+        spec = CFG.ZONE_KERNEL_SPECS[zone_id]
+        kernels.append(build_kernel_np(spec, CFG.KERNEL_SIZE))
+    kernels = np.stack(kernels, axis=0)[:, None, :, :]
+    return torch.tensor(kernels, dtype=torch.float32, device=device)
 
 
-def apply_pdk_filter(
-    img: np.ndarray,
-    region_map: np.ndarray,
-    region_sigmas: dict = None,
-    kernel_size: int = None,
-) -> np.ndarray:
-    if region_sigmas is None:
-        region_sigmas = CFG.REGION_SIGMAS
-    if kernel_size is None:
-        kernel_size = CFG.KERNEL_SIZE
+def apply_kernel_bank_soft(img: torch.Tensor, zone_probs: torch.Tensor, kernel_bank: torch.Tensor) -> torch.Tensor:
+    """
+    img: [B,1,H,W]
+    zone_probs: [B,3,H,W]
+    kernel_bank: [3,1,K,K]
+    """
+    k = kernel_bank.shape[-1]
+    pad = k // 2
 
-    out = np.zeros_like(img, dtype=np.float32)
+    filtered_list = []
+    for i in range(kernel_bank.shape[0]):
+        out_i = F.conv2d(img, kernel_bank[i:i+1], padding=pad)
+        filtered_list.append(out_i)
+    filtered = torch.cat(filtered_list, dim=1)    # [B,3,H,W]
 
-    filtered_bank = {}
-    for region_id, sigma in region_sigmas.items():
-        kernel = gaussian_kernel(kernel_size, sigma)
-        filtered_bank[region_id] = convolve(img, kernel, mode="reflect").astype(np.float32)
+    pred = (filtered * zone_probs).sum(dim=1, keepdim=True)
+    pred = pred.clamp(0.0, 1.0)
+    return pred
 
-    for region_id in region_sigmas.keys():
-        mask = (region_map == region_id)
-        out[mask] = filtered_bank[region_id][mask]
 
-    return clip01(out)
+def apply_kernel_bank_hard(img: torch.Tensor, zone_map: torch.Tensor, kernel_bank: torch.Tensor) -> torch.Tensor:
+    """
+    zone_map: [B,H,W], int64 in {0,1,2}
+    """
+    k = kernel_bank.shape[-1]
+    pad = k // 2
+
+    filtered_list = []
+    for i in range(kernel_bank.shape[0]):
+        out_i = F.conv2d(img, kernel_bank[i:i+1], padding=pad)
+        filtered_list.append(out_i)
+    filtered = torch.cat(filtered_list, dim=1)  # [B,3,H,W]
+
+    onehot = F.one_hot(zone_map.long(), num_classes=3).permute(0, 3, 1, 2).float()
+    pred = (filtered * onehot).sum(dim=1, keepdim=True)
+    pred = pred.clamp(0.0, 1.0)
+    return pred
+
+
+def apply_global_gaussian(img: torch.Tensor, sigma: float) -> torch.Tensor:
+    kernel_np = gaussian_kernel_np(CFG.KERNEL_SIZE, sigma)
+    kernel = torch.tensor(kernel_np, dtype=torch.float32, device=img.device)[None, None, :, :]
+    pad = CFG.KERNEL_SIZE // 2
+    out = F.conv2d(img, kernel, padding=pad)
+    return out.clamp(0.0, 1.0)
