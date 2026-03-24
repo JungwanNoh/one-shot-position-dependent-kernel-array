@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 
 from config import CFG
-from utils import set_seed, ensure_dir, device_string
+from utils import set_seed
 from dataset import list_image_files, BSDSAttentionDataset
 from filters import (
     get_zone_kernel_bank,
@@ -16,10 +16,16 @@ from filters import (
     apply_global_gaussian,
     gaussian_kernel_np,
 )
-from attention_net import AttentionZoneNet, saliency_to_soft_zones, saliency_to_hard_zones
+from fovea_net import FoveaParamNet, params_to_soft_zones, params_to_hard_zones
 from losses import total_train_loss, reconstruction_loss, selection_score_from_losses
 from metrics import compute_metrics_np
-from visualize import save_image, save_zone_map, save_attention_panel, save_barplot
+from visualize import save_image, save_zone_map, save_fovea_panel, save_barplot
+
+
+def device_string(preferred: str = "cuda") -> str:
+    if preferred == "cuda" and torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
 def to_numpy_img(x: torch.Tensor) -> np.ndarray:
@@ -92,16 +98,11 @@ def train_one_epoch(model, loader, optimizer, kernel_bank, device):
 
         optimizer.zero_grad()
 
-        saliency = model(observed)
-        zone_probs = saliency_to_soft_zones(
-            saliency,
-            low=CFG.SAL_LOW,
-            high=CFG.SAL_HIGH,
-            temp=CFG.SOFT_TEMP,
-        )
+        params = model(observed)
+        zone_probs, _ = params_to_soft_zones(params, observed.shape[-2], observed.shape[-1], device)
         pred = apply_kernel_bank_soft(observed, zone_probs, kernel_bank)
 
-        loss, log = total_train_loss(pred, clean, saliency, zone_probs)
+        loss, log = total_train_loss(pred, clean, zone_probs)
         loss.backward()
         optimizer.step()
 
@@ -122,8 +123,8 @@ def validate(model, loader, kernel_bank, device):
         observed = batch["observed"].to(device)
         clean = batch["clean"].to(device)
 
-        saliency = model(observed)
-        zone_map = saliency_to_hard_zones(saliency, low=CFG.SAL_LOW, high=CFG.SAL_HIGH)
+        params = model(observed)
+        zone_map, _ = params_to_hard_zones(params, observed.shape[-2], observed.shape[-1], device)
         pred = apply_kernel_bank_hard(observed, zone_map, kernel_bank)
 
         rec = reconstruction_loss(pred, clean)
@@ -148,9 +149,9 @@ def evaluate_test(model, test_loader, kernel_bank, global_sigma, device):
     img_dir = os.path.join(CFG.SAVE_ROOT, "images")
     panel_dir = os.path.join(CFG.SAVE_ROOT, "panels")
     plot_dir = os.path.join(CFG.SAVE_ROOT, "plots")
-    ensure_dir(img_dir)
-    ensure_dir(panel_dir)
-    ensure_dir(plot_dir)
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(panel_dir, exist_ok=True)
+    os.makedirs(plot_dir, exist_ok=True)
 
     rows = []
 
@@ -171,18 +172,19 @@ def evaluate_test(model, test_loader, kernel_bank, global_sigma, device):
         observed = batch["observed"].to(device)
         clean = batch["clean"].to(device)
 
-        saliency = model(observed)
-        zone_map = saliency_to_hard_zones(saliency, low=CFG.SAL_LOW, high=CFG.SAL_HIGH)
+        params = model(observed)
+        zone_probs, dist = params_to_soft_zones(params, observed.shape[-2], observed.shape[-1], device)
+        zone_map, _ = params_to_hard_zones(params, observed.shape[-2], observed.shape[-1], device)
 
         out_global = apply_global_gaussian(observed, sigma=global_sigma)
         out_pdk = apply_kernel_bank_hard(observed, zone_map, kernel_bank)
 
         clean_np = to_numpy_img(clean)
         observed_np = to_numpy_img(observed)
-        saliency_np = to_numpy_img(saliency)
-        zone_map_np = zone_map.detach().cpu().squeeze().numpy().astype(np.int32)
         global_np = to_numpy_img(out_global)
         pdk_np = to_numpy_img(out_pdk)
+        zone_map_np = zone_map.detach().cpu().squeeze().numpy().astype(np.int32)
+        fovea_score_np = zone_probs[:, 0:1].detach().cpu().squeeze().numpy().astype(np.float32)
 
         m_obs = compute_metrics_np(observed_np, clean_np)
         m_global = compute_metrics_np(global_np, clean_np)
@@ -190,6 +192,10 @@ def evaluate_test(model, test_loader, kernel_bank, global_sigma, device):
 
         rows.append({
             "name": name,
+            "cx": float(params["cx"].detach().cpu().item()),
+            "cy": float(params["cy"].detach().cpu().item()),
+            "r1": float(params["r1"].detach().cpu().item()),
+            "r2": float(params["r2"].detach().cpu().item()),
             "psnr_observed": m_obs["psnr"],
             "psnr_global": m_global["psnr"],
             "psnr_pdk": m_pdk["psnr"],
@@ -222,26 +228,27 @@ def evaluate_test(model, test_loader, kernel_bank, global_sigma, device):
         if CFG.SAVE_INDIVIDUAL_IMAGES:
             save_image(os.path.join(img_dir, f"{name}_clean.png"), clean_np)
             save_image(os.path.join(img_dir, f"{name}_observed.png"), observed_np)
-            save_image(os.path.join(img_dir, f"{name}_saliency.png"), saliency_np, cmap="magma")
+            save_image(os.path.join(img_dir, f"{name}_fovea_score.png"), fovea_score_np, cmap="magma")
             save_zone_map(os.path.join(img_dir, f"{name}_zones.png"), zone_map_np)
             save_image(os.path.join(img_dir, f"{name}_global.png"), global_np)
             save_image(os.path.join(img_dir, f"{name}_pdk.png"), pdk_np)
 
         if CFG.SAVE_PANELS and idx < CFG.SAVE_MAX_PANELS:
-            save_attention_panel(
+            save_fovea_panel(
                 os.path.join(panel_dir, f"{name}_panel.png"),
                 clean=clean_np,
                 observed=observed_np,
                 global_out=global_np,
                 pdk_out=pdk_np,
-                saliency=saliency_np,
+                fovea_map=fovea_score_np,
                 zone_map=zone_map_np,
             )
 
         print(
             f"[{idx+1:02d}] {name} | "
-            f"PSNR obs/global/pdk = {m_obs['psnr']:.3f} / {m_global['psnr']:.3f} / {m_pdk['psnr']:.3f} | "
-            f"Grad obs/global/pdk = {m_obs['grad']:.5f} / {m_global['grad']:.5f} / {m_pdk['grad']:.5f}"
+            f"cx={params['cx'].item():.3f}, cy={params['cy'].item():.3f}, "
+            f"r1={params['r1'].item():.3f}, r2={params['r2'].item():.3f} | "
+            f"PSNR obs/global/pdk = {m_obs['psnr']:.3f} / {m_global['psnr']:.3f} / {m_pdk['psnr']:.3f}"
         )
 
     csv_path = os.path.join(CFG.SAVE_ROOT, "metrics_test.csv")
@@ -253,17 +260,17 @@ def evaluate_test(model, test_loader, kernel_bank, global_sigma, device):
     summary_psnr = {
         "Observed": float(np.mean(psnr_obs)),
         "Best Global": float(np.mean(psnr_global)),
-        "Attn-guided PDK": float(np.mean(psnr_pdk)),
+        "NN-Foveated PDK": float(np.mean(psnr_pdk)),
     }
     summary_ssim = {
         "Observed": float(np.mean(ssim_obs)),
         "Best Global": float(np.mean(ssim_global)),
-        "Attn-guided PDK": float(np.mean(ssim_pdk)),
+        "NN-Foveated PDK": float(np.mean(ssim_pdk)),
     }
     summary_grad = {
         "Observed": float(np.mean(grad_obs)),
         "Best Global": float(np.mean(grad_global)),
-        "Attn-guided PDK": float(np.mean(grad_pdk)),
+        "NN-Foveated PDK": float(np.mean(grad_pdk)),
     }
 
     save_barplot(os.path.join(plot_dir, "psnr_summary.png"), summary_psnr, ylabel="PSNR (dB)")
@@ -280,9 +287,7 @@ def main():
     train_loader, val_loader, test_loader = build_loaders()
     kernel_bank = get_zone_kernel_bank(device)
 
-    # ---------------------------------------------------------
-    # 1) Select best global sigma on validation
-    # ---------------------------------------------------------
+    # 1) best global search
     best_global_row, all_global_rows = select_best_global_sigma(val_loader, device)
     best_global_sigma = best_global_row["sigma"]
     best_global_kernel = gaussian_kernel_np(CFG.KERNEL_SIZE, best_global_sigma)
@@ -291,9 +296,7 @@ def main():
     for row in all_global_rows:
         print(
             f"sigma={row['sigma']:.2f} | "
-            f"L1={row['l1']:.6f} | "
-            f"Grad={row['grad']:.6f} | "
-            f"Score={row['score']:.6f}"
+            f"L1={row['l1']:.6f} | Grad={row['grad']:.6f} | Score={row['score']:.6f}"
         )
 
     print("\nSelected best global sigma:")
@@ -302,15 +305,13 @@ def main():
     print("  kernel =")
     print(np.array2string(best_global_kernel, precision=4, suppress_small=True))
 
-    # ---------------------------------------------------------
-    # 2) Train attention-guided zone selector
-    # ---------------------------------------------------------
-    model = AttentionZoneNet(in_ch=1, base_ch=32).to(device)
+    # 2) train fovea-param net
+    model = FoveaParamNet(in_ch=1, base_ch=32).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=CFG.LR, weight_decay=CFG.WEIGHT_DECAY)
 
     best_state = None
     best_val_score = float("inf")
-    ckpt_path = os.path.join(CFG.SAVE_ROOT, "best_attention_model.pt")
+    ckpt_path = os.path.join(CFG.SAVE_ROOT, "best_fovea_model.pt")
 
     for epoch in range(1, CFG.EPOCHS + 1):
         train_log = train_one_epoch(model, train_loader, optimizer, kernel_bank, device)
@@ -318,28 +319,29 @@ def main():
 
         print(
             f"Epoch {epoch:03d} | "
-            f"Train total={train_log['total']:.5f}, l1={train_log['l1']:.5f}, grad={train_log['grad']:.5f}, "
-            f"tv={train_log['tv']:.5f}, ratio={train_log['ratio']:.5f} | "
+            f"Train total={train_log['total']:.5f}, l1={train_log['l1']:.5f}, "
+            f"grad={train_log['grad']:.5f}, ratio={train_log['ratio']:.5f} | "
             f"Val l1={val_log['l1']:.5f}, grad={val_log['grad']:.5f}, score={val_log['score']:.5f}"
         )
 
         if val_log["score"] < best_val_score:
             best_val_score = val_log["score"]
             best_state = copy.deepcopy(model.state_dict())
-            torch.save({
-                "model_state_dict": best_state,
-                "val_score": best_val_score,
-                "best_global_sigma": best_global_sigma,
-            }, ckpt_path)
+            torch.save(
+                {
+                    "model_state_dict": best_state,
+                    "val_score": best_val_score,
+                    "best_global_sigma": best_global_sigma,
+                },
+                ckpt_path,
+            )
 
     if best_state is None:
         raise RuntimeError("Training failed: no checkpoint saved.")
 
     model.load_state_dict(best_state)
 
-    # ---------------------------------------------------------
-    # 3) Test evaluation
-    # ---------------------------------------------------------
+    # 3) test
     summary_psnr, summary_ssim, summary_grad = evaluate_test(
         model=model,
         test_loader=test_loader,

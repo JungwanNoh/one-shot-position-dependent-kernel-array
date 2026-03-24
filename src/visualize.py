@@ -23,13 +23,13 @@ def save_zone_map(path: str, zone_map: np.ndarray):
     plt.close()
 
 
-def save_attention_panel(
+def save_fovea_panel(
     save_path: str,
     clean: np.ndarray,
     observed: np.ndarray,
     global_out: np.ndarray,
     pdk_out: np.ndarray,
-    saliency: np.ndarray,
+    fovea_map: np.ndarray,
     zone_map: np.ndarray,
 ):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -47,12 +47,12 @@ def save_attention_panel(
     axes[0, 1].set_title("Observed")
     axes[0, 1].axis("off")
 
-    axes[0, 2].imshow(saliency, cmap="magma", vmin=0, vmax=1)
-    axes[0, 2].set_title("Saliency Map")
+    axes[0, 2].imshow(fovea_map, cmap="magma", vmin=0, vmax=1)
+    axes[0, 2].set_title("Fovea Score")
     axes[0, 2].axis("off")
 
     axes[0, 3].imshow(zone_map, cmap="viridis", vmin=0, vmax=2)
-    axes[0, 3].set_title("3-zone Map")
+    axes[0, 3].set_title("Foveated 3-zone")
     axes[0, 3].axis("off")
 
     axes[1, 0].imshow(global_out, cmap="gray", vmin=0, vmax=1)
@@ -60,7 +60,7 @@ def save_attention_panel(
     axes[1, 0].axis("off")
 
     axes[1, 1].imshow(pdk_out, cmap="gray", vmin=0, vmax=1)
-    axes[1, 1].set_title("Attention-guided PDK")
+    axes[1, 1].set_title("NN-Foveated PDK")
     axes[1, 1].axis("off")
 
     axes[1, 2].imshow(err_global, cmap="inferno")

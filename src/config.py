@@ -10,7 +10,7 @@ class Config:
     # ---------------------------------------------------------
     TRAIN_ROOT: str = "../dat/BSDS300/images/train"
     TEST_ROOT: str = "../dat/BSDS300/images/test"
-    SAVE_ROOT: str = "../res/attention_guided_zone_selection"
+    SAVE_ROOT: str = "../res/nn_parameterized_foveated_zoning"
 
     # ---------------------------------------------------------
     # Data
@@ -27,18 +27,17 @@ class Config:
     SEED: int = 42
     DEVICE: str = "cuda"
     BATCH_SIZE: int = 8
-    EPOCHS: int = 40
+    EPOCHS: int = 10
     LR: float = 1e-3
     NUM_WORKERS: int = 0
     WEIGHT_DECAY: float = 1e-5
 
     # ---------------------------------------------------------
-    # Synthetic variability for observed image generation
+    # Synthetic observed image generation
     # ---------------------------------------------------------
     MAP_MODE: str = "radial"   # "radial" or "blocky"
     RADIAL_CENTER: Tuple[float, float] = (0.5, 0.5)
     RADIAL_FALLOFF: float = 1.6
-
     V_MAX: float = 1.0
     V_MIN: float = 0.45
 
@@ -46,40 +45,42 @@ class Config:
     NOISE_SIGMA_ALPHA: float = 0.08
 
     # ---------------------------------------------------------
-    # Kernel setup
+    # Kernel setup (3x3)
     # zone order: 0=attention, 1=intermediate, 2=around
     # ---------------------------------------------------------
     KERNEL_SIZE: int = 3
-    GLOBAL_SIGMA_CANDIDATES: Tuple[float, ...] = (0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 1.8)
+    GLOBAL_SIGMA_CANDIDATES: Tuple[float, ...] = (0.3, 0.5, 0.7, 0.9, 1.1)
 
     ZONE_KERNEL_SPECS: Dict[int, dict] = field(
         default_factory=lambda: {
-            0: {"family": "unsharp", "sigma": 0.9, "amount": 0.45},   # attention
+            0: {"family": "unsharp", "sigma": 0.6, "amount": 0.20},  # attention
             1: {"family": "binomial"},                                # intermediate
-            2: {"family": "gaussian", "sigma": 1.6},                  # around
+            2: {"family": "gaussian", "sigma": 1.0},                  # around
         }
     )
 
     # ---------------------------------------------------------
-    # Saliency -> zone
+    # Foveated parameter ranges
+    # Predict center + radii
     # ---------------------------------------------------------
-    SAL_LOW: float = 0.35
-    SAL_HIGH: float = 0.65
-    SOFT_TEMP: float = 0.08
+    R1_MIN: float = 0.06
+    R1_MAX: float = 0.18
+    DR_MIN: float = 0.08
+    DR_MAX: float = 0.18
 
-    # desired average zone ratios for regularization
-    # attention / intermediate / around
-    TARGET_ZONE_RATIOS: Tuple[float, float, float] = (0.15, 0.25, 0.60)
+    SOFT_TEMP: float = 0.025
+
+    # weak zone-ratio prior only
+    TARGET_ZONE_RATIOS: Tuple[float, float, float] = (0.12, 0.23, 0.65)
 
     # ---------------------------------------------------------
-    # Loss weights
+    # Loss
     # ---------------------------------------------------------
     LOSS_W_L1: float = 0.70
     LOSS_W_GRAD: float = 0.30
-    LOSS_W_TV: float = 0.02
-    LOSS_W_RATIO: float = 0.05
+    LOSS_W_RATIO: float = 0.01
 
-    # model selection score: 0.7*L1 + 0.3*Grad
+    # model/global selection
     SELECT_W_L1: float = 0.70
     SELECT_W_GRAD: float = 0.30
 

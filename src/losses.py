@@ -31,17 +31,7 @@ def gradient_l1_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(gp, gt)
 
 
-def tv_loss(x: torch.Tensor) -> torch.Tensor:
-    dh = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]).mean()
-    dw = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]).mean()
-    return dh + dw
-
-
 def zone_ratio_loss(zone_probs: torch.Tensor) -> torch.Tensor:
-    """
-    zone_probs: [B,3,H,W]
-    target ratios order: attention, intermediate, around
-    """
     actual = zone_probs.mean(dim=(0, 2, 3))
     target = torch.tensor(CFG.TARGET_ZONE_RATIOS, dtype=zone_probs.dtype, device=zone_probs.device)
     return F.l1_loss(actual, target)
@@ -53,15 +43,13 @@ def reconstruction_loss(pred: torch.Tensor, target: torch.Tensor) -> dict:
     return {"l1": l1, "grad": grad}
 
 
-def total_train_loss(pred: torch.Tensor, target: torch.Tensor, saliency: torch.Tensor, zone_probs: torch.Tensor) -> tuple[torch.Tensor, dict]:
+def total_train_loss(pred: torch.Tensor, target: torch.Tensor, zone_probs: torch.Tensor):
     rec = reconstruction_loss(pred, target)
-    tv = tv_loss(saliency)
     ratio = zone_ratio_loss(zone_probs)
 
     total = (
         CFG.LOSS_W_L1 * rec["l1"]
         + CFG.LOSS_W_GRAD * rec["grad"]
-        + CFG.LOSS_W_TV * tv
         + CFG.LOSS_W_RATIO * ratio
     )
 
@@ -69,7 +57,6 @@ def total_train_loss(pred: torch.Tensor, target: torch.Tensor, saliency: torch.T
         "total": float(total.detach().cpu()),
         "l1": float(rec["l1"].detach().cpu()),
         "grad": float(rec["grad"].detach().cpu()),
-        "tv": float(tv.detach().cpu()),
         "ratio": float(ratio.detach().cpu()),
     }
     return total, log

@@ -52,10 +52,6 @@ def build_kernel_np(spec: dict, kernel_size: int | None = None) -> np.ndarray:
 
 
 def get_zone_kernel_bank(device: str) -> torch.Tensor:
-    """
-    zone order: 0=attention, 1=intermediate, 2=around
-    return shape [3,1,K,K]
-    """
     kernels = []
     for zone_id in [0, 1, 2]:
         spec = CFG.ZONE_KERNEL_SPECS[zone_id]
@@ -65,29 +61,6 @@ def get_zone_kernel_bank(device: str) -> torch.Tensor:
 
 
 def apply_kernel_bank_soft(img: torch.Tensor, zone_probs: torch.Tensor, kernel_bank: torch.Tensor) -> torch.Tensor:
-    """
-    img: [B,1,H,W]
-    zone_probs: [B,3,H,W]
-    kernel_bank: [3,1,K,K]
-    """
-    k = kernel_bank.shape[-1]
-    pad = k // 2
-
-    filtered_list = []
-    for i in range(kernel_bank.shape[0]):
-        out_i = F.conv2d(img, kernel_bank[i:i+1], padding=pad)
-        filtered_list.append(out_i)
-    filtered = torch.cat(filtered_list, dim=1)    # [B,3,H,W]
-
-    pred = (filtered * zone_probs).sum(dim=1, keepdim=True)
-    pred = pred.clamp(0.0, 1.0)
-    return pred
-
-
-def apply_kernel_bank_hard(img: torch.Tensor, zone_map: torch.Tensor, kernel_bank: torch.Tensor) -> torch.Tensor:
-    """
-    zone_map: [B,H,W], int64 in {0,1,2}
-    """
     k = kernel_bank.shape[-1]
     pad = k // 2
 
@@ -97,10 +70,23 @@ def apply_kernel_bank_hard(img: torch.Tensor, zone_map: torch.Tensor, kernel_ban
         filtered_list.append(out_i)
     filtered = torch.cat(filtered_list, dim=1)  # [B,3,H,W]
 
+    pred = (filtered * zone_probs).sum(dim=1, keepdim=True)
+    return pred.clamp(0.0, 1.0)
+
+
+def apply_kernel_bank_hard(img: torch.Tensor, zone_map: torch.Tensor, kernel_bank: torch.Tensor) -> torch.Tensor:
+    k = kernel_bank.shape[-1]
+    pad = k // 2
+
+    filtered_list = []
+    for i in range(kernel_bank.shape[0]):
+        out_i = F.conv2d(img, kernel_bank[i:i+1], padding=pad)
+        filtered_list.append(out_i)
+    filtered = torch.cat(filtered_list, dim=1)
+
     onehot = F.one_hot(zone_map.long(), num_classes=3).permute(0, 3, 1, 2).float()
     pred = (filtered * onehot).sum(dim=1, keepdim=True)
-    pred = pred.clamp(0.0, 1.0)
-    return pred
+    return pred.clamp(0.0, 1.0)
 
 
 def apply_global_gaussian(img: torch.Tensor, sigma: float) -> torch.Tensor:
