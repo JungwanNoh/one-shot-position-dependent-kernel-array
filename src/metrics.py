@@ -22,17 +22,17 @@ def ssim_metric(pred: np.ndarray, target: np.ndarray) -> float:
     return float(ssim(target, pred, data_range=1.0))
 
 
-def gradient_mag(img: np.ndarray) -> np.ndarray:
+def grad_mag(img: np.ndarray) -> np.ndarray:
     gx = sobel(img, axis=1, mode="reflect")
     gy = sobel(img, axis=0, mode="reflect")
-    return np.sqrt(gx**2 + gy**2).astype(np.float32)
+    return np.sqrt(gx ** 2 + gy ** 2).astype(np.float32)
 
 
 def grad_l1(pred: np.ndarray, target: np.ndarray) -> float:
-    return float(np.mean(np.abs(gradient_mag(pred) - gradient_mag(target))))
+    return float(np.mean(np.abs(grad_mag(pred) - grad_mag(target))))
 
 
-def compute_all_metrics(pred: np.ndarray, target: np.ndarray) -> dict:
+def compute_metrics(pred: np.ndarray, target: np.ndarray) -> dict:
     return {
         "l1": l1(pred, target),
         "mse": mse(pred, target),

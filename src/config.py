@@ -1,93 +1,88 @@
 import os
-from dataclasses import dataclass, field
-from typing import Tuple, Dict
 
+SEED = 42
+DEVICE = "cuda"
+SAVE_ROOT = "../res/pdk_multitask"
 
-@dataclass
-class Config:
-    # ---------------------------------------------------------
-    # Common
-    # ---------------------------------------------------------
-    SEED: int = 42
-    IMAGE_SIZE: Tuple[int, int] = (256, 256)
-    FILE_EXTENSIONS: Tuple[str, ...] = (".jpg", ".jpeg", ".png", ".bmp")
-    SAVE_ROOT: str = "../res/global_first_pdk"
+COMMON = {
+    "image_size": (256, 256),
+    "kernel_size": 3,
+    "zone_kernel_specs": {
+        0: {"family": "unsharp", "sigma": 0.5, "amount": 0.12},  # attention
+        1: {"family": "binomial"},                                  # intermediate
+        2: {"family": "gaussian", "sigma": 0.9},                  # around
+    },
+    # realistic fixed global presets per task
+    "global_specs": {
+        "synthetic": {"family": "gaussian", "sigma": 0.7},
+        "lowlight": {"family": "gaussian", "sigma": 0.7},
+        "natural": {"family": "binomial"},
+        "classification": {"family": "gaussian", "sigma": 0.7},
+    },
+}
 
-    # ---------------------------------------------------------
-    # Common PDK
-    # zone order: 0=attention, 1=intermediate, 2=around
-    # ---------------------------------------------------------
-    KERNEL_SIZE: int = 3
-    ZONE_KERNEL_SPECS: Dict[int, dict] = field(
-        default_factory=lambda: {
-            0: {"family": "unsharp", "sigma": 0.5, "amount": 0.12},  # attention
-            1: {"family": "binomial"},                                # intermediate
-            2: {"family": "gaussian", "sigma": 0.9},                  # around
-        }
-    )
+SYNTHETIC = {
+    "root": "../dat/BSDS300/images/test",
+    "max_images": 30,
+    "save_dir": os.path.join(SAVE_ROOT, "synthetic_nonuniform"),
+    "map_mode": "radial",     # radial or blocky
+    "radial_center": (0.5, 0.5),
+    "radial_falloff": 1.6,
+    "v_max": 1.0,
+    "v_min": 0.45,
+    "noise_sigma_min": 0.01,
+    "noise_sigma_alpha": 0.08,
+    # reliability -> zones, high value = good region
+    "th_high": 0.78,
+    "th_mid": 0.58,
+    "save_max_panels": 8,
+}
 
-    # fixed global presets, no oracle search
-    GLOBAL_SIGMA_SYNTHETIC: float = 0.7
-    GLOBAL_SIGMA_LOWLIGHT: float = 0.7
-    GLOBAL_SIGMA_CLASSIFICATION: float = 0.7
+LOWLIGHT = {
+    # paired folders with matching filenames
+    "low_dir": "../dat/LOL/eval15/low",
+    "high_dir": "../dat/LOL/eval15/high",
+    "max_images": 50,
+    "save_dir": os.path.join(SAVE_ROOT, "lowlight"),
+    # bright/reliable -> attention, dark/noisy -> around
+    "illum_high": 0.62,
+    "illum_mid": 0.38,
+    "save_max_panels": 8,
+}
 
-    # zone quantization by score percentiles
-    SCORE_HIGH_PERCENTILE: float = 85.0
-    SCORE_MID_PERCENTILE: float = 55.0
+NATURAL = {
+    "root": "../dat/BSDS300/images/test",
+    "max_images": 20,
+    "save_dir": os.path.join(SAVE_ROOT, "natural_demo"),
+    # pseudo-fovea radii from image content center
+    "r1": 0.12,
+    "r2": 0.28,
+    "save_max_panels": 8,
+}
 
-    # ---------------------------------------------------------
-    # Synthetic task
-    # ---------------------------------------------------------
-    SYNTHETIC_ROOT: str = "../dat/BSDS300/images/test"
-    SYNTHETIC_MAX_IMAGES: int | None = 30
-    SYNTHETIC_MAP_MODE: str = "radial"  # radial or blocky
-    SYNTHETIC_V_MIN: float = 0.45
-    SYNTHETIC_V_MAX: float = 1.0
-    SYNTHETIC_NOISE_SIGMA_MIN: float = 0.01
-    SYNTHETIC_NOISE_SIGMA_ALPHA: float = 0.08
-    SYNTHETIC_RADIAL_CENTER: Tuple[float, float] = (0.5, 0.5)
-    SYNTHETIC_RADIAL_FALLOFF: float = 1.6
-    SYNTHETIC_SCORE_WEIGHTS: Tuple[float, float, float] = (0.45, 0.25, 0.30)  # residual, gradient, unreliability
+CLASSIFICATION = {
+    # CIFAR10, STL10, TINYIMAGENET
+    "dataset": "TINYIMAGENET", # "TINYIMAGENET"
+    "data_root": "../dat/torchvision",
+    # Standard Tiny ImageNet extracted folder, e.g. ../dat/tiny-imagenet-200
+    "tiny_imagenet_root": "../dat/tiny-imagenet-200",
+    "save_dir": os.path.join(SAVE_ROOT, "classification"),
+    "batch_size": 128,
+    # small/medium defaults; override if needed
+    "epochs": 10,
+    "lr": 3e-4,
+    "weight_decay": 1e-4,
+    "num_workers": 0,
+    "backbone": "resnet18",
+    # optional stronger recipe toggles
+    "use_randaugment": True,
+    "randaugment_num_ops": 2,
+    "randaugment_magnitude": 9,
+    # PDK head regularization
+    "ratio_target": (0.15, 0.25, 0.60),
+    "loss_w_ce": 1.0,
+    "loss_w_ratio": 0.01,
+    "loss_w_entropy": 0.002,
+}
 
-    # ---------------------------------------------------------
-    # Low-light task
-    # ---------------------------------------------------------
-    LOWLIGHT_INPUT_ROOT = "../dat/LOL/eval15/low"
-    LOWLIGHT_GT_ROOT = "../dat/LOL/eval15/high"
-    LOWLIGHT_MAX_IMAGES: int | None = 50
-    LOWLIGHT_ILLUM_SIGMA: float = 5.0
-    LOWLIGHT_SCORE_WEIGHTS: Tuple[float, float, float] = (0.35, 0.20, 0.45)  # residual, gradient, lowlightness
-
-    # ---------------------------------------------------------
-    # Natural demo task
-    # ---------------------------------------------------------
-    NATURAL_ROOT: str = "../dat/BSDS300/images/test"
-    NATURAL_MAX_IMAGES: int | None = 20
-    NATURAL_SCORE_WEIGHTS: Tuple[float, float] = (0.55, 0.45)  # residual, edge
-
-    # ---------------------------------------------------------
-    # Classification task
-    # ---------------------------------------------------------
-    CLS_DATA_ROOT: str = "../dataset"
-    CLS_DATASET: str = "CIFAR10"
-    CLS_DEVICE: str = "cuda"
-    CLS_BATCH_SIZE: int = 128
-    CLS_EPOCHS: int = 10
-    CLS_LR: float = 1e-3
-    CLS_WEIGHT_DECAY: float = 1e-5
-    CLS_NUM_WORKERS: int = 0
-
-    # zone regularization for learned classification branch
-    CLS_TARGET_ZONE_RATIOS: Tuple[float, float, float] = (0.15, 0.25, 0.60)
-    CLS_LOSS_W_CE: float = 1.0
-    CLS_LOSS_W_RATIO: float = 0.01
-    CLS_LOSS_W_ENTROPY: float = 0.002
-
-    # ---------------------------------------------------------
-    # Save
-    # ---------------------------------------------------------
-    SAVE_MAX_PANELS: int = 8
-
-
-CFG = Config()
-os.makedirs(CFG.SAVE_ROOT, exist_ok=True)
+os.makedirs(SAVE_ROOT, exist_ok=True)

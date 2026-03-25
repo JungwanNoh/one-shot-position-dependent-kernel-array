@@ -1,32 +1,30 @@
 import argparse
-from utils import set_seed
-from config import CFG
+
+from synthetic_task import run_synthetic
+from lowlight_task import run_lowlight
+from natural_demo_task import run_natural_demo
+from classification_task import run_classification
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--task",
-        type=str,
-        required=True,
-        choices=["synthetic", "lowlight", "natural", "classification"],
-    )
+    parser.add_argument("--task", type=str, required=True,
+                        choices=["synthetic", "lowlight", "natural", "classification", "all"])
     args = parser.parse_args()
 
-    set_seed(CFG.SEED)
-
     if args.task == "synthetic":
-        from synthetic_task import run
-        run()
+        run_synthetic()
     elif args.task == "lowlight":
-        from lowlight_task import run
-        run()
+        run_lowlight()
     elif args.task == "natural":
-        from natural_demo_task import run
-        run()
+        run_natural_demo()
     elif args.task == "classification":
-        from classification_task import run
-        run()
+        run_classification()
+    elif args.task == "all":
+        run_synthetic()
+        run_lowlight()
+        run_natural_demo()
+        run_classification()
 
 
 if __name__ == "__main__":
