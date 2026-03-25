@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 
@@ -37,20 +38,34 @@ def zone_ratio_loss(zone_probs: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(actual, target)
 
 
+def heatmap_entropy_loss(heatmap_probs: torch.Tensor) -> torch.Tensor:
+    """
+    Lower entropy -> more concentrated fixation
+    normalized to roughly [0,1]
+    """
+    b, _, h, w = heatmap_probs.shape
+    flat = heatmap_probs.view(b, -1)
+    ent = -(flat * torch.log(flat + 1e-8)).sum(dim=1)
+    ent = ent / math.log(h * w)
+    return ent.mean()
+
+
 def reconstruction_loss(pred: torch.Tensor, target: torch.Tensor) -> dict:
     l1 = F.l1_loss(pred, target)
     grad = gradient_l1_loss(pred, target)
     return {"l1": l1, "grad": grad}
 
 
-def total_train_loss(pred: torch.Tensor, target: torch.Tensor, zone_probs: torch.Tensor):
+def total_train_loss(pred: torch.Tensor, target: torch.Tensor, zone_probs: torch.Tensor, heatmap_probs: torch.Tensor):
     rec = reconstruction_loss(pred, target)
     ratio = zone_ratio_loss(zone_probs)
+    entropy = heatmap_entropy_loss(heatmap_probs)
 
     total = (
         CFG.LOSS_W_L1 * rec["l1"]
         + CFG.LOSS_W_GRAD * rec["grad"]
         + CFG.LOSS_W_RATIO * ratio
+        + CFG.LOSS_W_ENTROPY * entropy
     )
 
     log = {
@@ -58,6 +73,7 @@ def total_train_loss(pred: torch.Tensor, target: torch.Tensor, zone_probs: torch
         "l1": float(rec["l1"].detach().cpu()),
         "grad": float(rec["grad"].detach().cpu()),
         "ratio": float(ratio.detach().cpu()),
+        "entropy": float(entropy.detach().cpu()),
     }
     return total, log
 

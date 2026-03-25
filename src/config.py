@@ -53,22 +53,24 @@ class Config:
 
     ZONE_KERNEL_SPECS: Dict[int, dict] = field(
         default_factory=lambda: {
-            0: {"family": "unsharp", "sigma": 0.6, "amount": 0.20},  # attention
+            0: {"family": "unsharp", "sigma": 0.5, "amount": 0.12},  # attention
             1: {"family": "binomial"},                                # intermediate
-            2: {"family": "gaussian", "sigma": 1.0},                  # around
+            2: {"family": "gaussian", "sigma": 0.9},                  # around
         }
     )
 
     # ---------------------------------------------------------
     # Foveated parameter ranges
-    # Predict center + radii
     # ---------------------------------------------------------
-    R1_MIN: float = 0.06
+    R1_MIN: float = 0.05
     R1_MAX: float = 0.18
     DR_MIN: float = 0.08
     DR_MAX: float = 0.18
 
     SOFT_TEMP: float = 0.025
+
+    # heatmap -> soft-argmax temperature
+    HEATMAP_SOFTMAX_TEMP: float = 0.07
 
     # weak zone-ratio prior only
     TARGET_ZONE_RATIOS: Tuple[float, float, float] = (0.12, 0.23, 0.65)
@@ -79,6 +81,7 @@ class Config:
     LOSS_W_L1: float = 0.70
     LOSS_W_GRAD: float = 0.30
     LOSS_W_RATIO: float = 0.01
+    LOSS_W_ENTROPY: float = 0.002
 
     # model/global selection
     SELECT_W_L1: float = 0.70

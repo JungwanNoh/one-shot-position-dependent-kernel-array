@@ -16,7 +16,7 @@ from filters import (
     apply_global_gaussian,
     gaussian_kernel_np,
 )
-from fovea_net import FoveaParamNet, params_to_soft_zones, params_to_hard_zones
+from fovea_net import FoveaHeatmapNet, params_to_soft_zones, params_to_hard_zones
 from losses import total_train_loss, reconstruction_loss, selection_score_from_losses
 from metrics import compute_metrics_np
 from visualize import save_image, save_zone_map, save_fovea_panel, save_barplot
@@ -30,6 +30,11 @@ def device_string(preferred: str = "cuda") -> str:
 
 def to_numpy_img(x: torch.Tensor) -> np.ndarray:
     return x.detach().cpu().squeeze().numpy().astype(np.float32)
+
+
+def normalize_map_for_vis(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float32)
+    return x / (x.max() + 1e-8)
 
 
 def build_loaders():
@@ -92,6 +97,8 @@ def train_one_epoch(model, loader, optimizer, kernel_bank, device):
     model.train()
     logs = []
 
+    cx_list, cy_list, r1_list, r2_list = [], [], [], []
+
     for batch in loader:
         observed = batch["observed"].to(device)
         clean = batch["clean"].to(device)
@@ -102,13 +109,26 @@ def train_one_epoch(model, loader, optimizer, kernel_bank, device):
         zone_probs, _ = params_to_soft_zones(params, observed.shape[-2], observed.shape[-1], device)
         pred = apply_kernel_bank_soft(observed, zone_probs, kernel_bank)
 
-        loss, log = total_train_loss(pred, clean, zone_probs)
+        loss, log = total_train_loss(pred, clean, zone_probs, params["heatmap_probs"])
         loss.backward()
         optimizer.step()
 
         logs.append(log)
 
+        cx_list.extend(params["cx"].detach().cpu().numpy().tolist())
+        cy_list.extend(params["cy"].detach().cpu().numpy().tolist())
+        r1_list.extend(params["r1"].detach().cpu().numpy().tolist())
+        r2_list.extend(params["r2"].detach().cpu().numpy().tolist())
+
     mean_log = {k: float(np.mean([x[k] for x in logs])) for k in logs[0].keys()}
+    mean_log["cx"] = float(np.mean(cx_list))
+    mean_log["cy"] = float(np.mean(cy_list))
+    mean_log["r1"] = float(np.mean(r1_list))
+    mean_log["r2"] = float(np.mean(r2_list))
+    mean_log["cx_std"] = float(np.std(cx_list))
+    mean_log["cy_std"] = float(np.std(cy_list))
+    mean_log["r1_std"] = float(np.std(r1_list))
+    mean_log["r2_std"] = float(np.std(r2_list))
     return mean_log
 
 
@@ -118,6 +138,8 @@ def validate(model, loader, kernel_bank, device):
 
     total_l1 = []
     total_grad = []
+
+    cx_list, cy_list, r1_list, r2_list = [], [], [], []
 
     for batch in loader:
         observed = batch["observed"].to(device)
@@ -131,6 +153,11 @@ def validate(model, loader, kernel_bank, device):
         total_l1.append(float(rec["l1"].detach().cpu()))
         total_grad.append(float(rec["grad"].detach().cpu()))
 
+        cx_list.extend(params["cx"].detach().cpu().numpy().tolist())
+        cy_list.extend(params["cy"].detach().cpu().numpy().tolist())
+        r1_list.extend(params["r1"].detach().cpu().numpy().tolist())
+        r2_list.extend(params["r2"].detach().cpu().numpy().tolist())
+
     mean_l1 = float(np.mean(total_l1))
     mean_grad = float(np.mean(total_grad))
     score = selection_score_from_losses(mean_l1, mean_grad)
@@ -139,6 +166,14 @@ def validate(model, loader, kernel_bank, device):
         "l1": mean_l1,
         "grad": mean_grad,
         "score": score,
+        "cx": float(np.mean(cx_list)),
+        "cy": float(np.mean(cy_list)),
+        "r1": float(np.mean(r1_list)),
+        "r2": float(np.mean(r2_list)),
+        "cx_std": float(np.std(cx_list)),
+        "cy_std": float(np.std(cy_list)),
+        "r1_std": float(np.std(r1_list)),
+        "r2_std": float(np.std(r2_list)),
     }
 
 
@@ -173,7 +208,6 @@ def evaluate_test(model, test_loader, kernel_bank, global_sigma, device):
         clean = batch["clean"].to(device)
 
         params = model(observed)
-        zone_probs, dist = params_to_soft_zones(params, observed.shape[-2], observed.shape[-1], device)
         zone_map, _ = params_to_hard_zones(params, observed.shape[-2], observed.shape[-1], device)
 
         out_global = apply_global_gaussian(observed, sigma=global_sigma)
@@ -184,7 +218,7 @@ def evaluate_test(model, test_loader, kernel_bank, global_sigma, device):
         global_np = to_numpy_img(out_global)
         pdk_np = to_numpy_img(out_pdk)
         zone_map_np = zone_map.detach().cpu().squeeze().numpy().astype(np.int32)
-        fovea_score_np = zone_probs[:, 0:1].detach().cpu().squeeze().numpy().astype(np.float32)
+        heatmap_np = normalize_map_for_vis(to_numpy_img(params["heatmap_probs"]))
 
         m_obs = compute_metrics_np(observed_np, clean_np)
         m_global = compute_metrics_np(global_np, clean_np)
@@ -228,7 +262,7 @@ def evaluate_test(model, test_loader, kernel_bank, global_sigma, device):
         if CFG.SAVE_INDIVIDUAL_IMAGES:
             save_image(os.path.join(img_dir, f"{name}_clean.png"), clean_np)
             save_image(os.path.join(img_dir, f"{name}_observed.png"), observed_np)
-            save_image(os.path.join(img_dir, f"{name}_fovea_score.png"), fovea_score_np, cmap="magma")
+            save_image(os.path.join(img_dir, f"{name}_fovea_score.png"), heatmap_np, cmap="magma")
             save_zone_map(os.path.join(img_dir, f"{name}_zones.png"), zone_map_np)
             save_image(os.path.join(img_dir, f"{name}_global.png"), global_np)
             save_image(os.path.join(img_dir, f"{name}_pdk.png"), pdk_np)
@@ -240,7 +274,7 @@ def evaluate_test(model, test_loader, kernel_bank, global_sigma, device):
                 observed=observed_np,
                 global_out=global_np,
                 pdk_out=pdk_np,
-                fovea_map=fovea_score_np,
+                fovea_map=heatmap_np,
                 zone_map=zone_map_np,
             )
 
@@ -287,7 +321,6 @@ def main():
     train_loader, val_loader, test_loader = build_loaders()
     kernel_bank = get_zone_kernel_bank(device)
 
-    # 1) best global search
     best_global_row, all_global_rows = select_best_global_sigma(val_loader, device)
     best_global_sigma = best_global_row["sigma"]
     best_global_kernel = gaussian_kernel_np(CFG.KERNEL_SIZE, best_global_sigma)
@@ -305,13 +338,12 @@ def main():
     print("  kernel =")
     print(np.array2string(best_global_kernel, precision=4, suppress_small=True))
 
-    # 2) train fovea-param net
-    model = FoveaParamNet(in_ch=1, base_ch=32).to(device)
+    model = FoveaHeatmapNet(in_ch=1, base_ch=32).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=CFG.LR, weight_decay=CFG.WEIGHT_DECAY)
 
     best_state = None
     best_val_score = float("inf")
-    ckpt_path = os.path.join(CFG.SAVE_ROOT, "best_fovea_model.pt")
+    ckpt_path = os.path.join(CFG.SAVE_ROOT, "best_fovea_heatmap_model.pt")
 
     for epoch in range(1, CFG.EPOCHS + 1):
         train_log = train_one_epoch(model, train_loader, optimizer, kernel_bank, device)
@@ -320,8 +352,16 @@ def main():
         print(
             f"Epoch {epoch:03d} | "
             f"Train total={train_log['total']:.5f}, l1={train_log['l1']:.5f}, "
-            f"grad={train_log['grad']:.5f}, ratio={train_log['ratio']:.5f} | "
-            f"Val l1={val_log['l1']:.5f}, grad={val_log['grad']:.5f}, score={val_log['score']:.5f}"
+            f"grad={train_log['grad']:.5f}, ratio={train_log['ratio']:.5f}, entropy={train_log['entropy']:.5f} | "
+            f"Train cx={train_log['cx']:.3f}±{train_log['cx_std']:.3f}, "
+            f"cy={train_log['cy']:.3f}±{train_log['cy_std']:.3f}, "
+            f"r1={train_log['r1']:.3f}±{train_log['r1_std']:.3f}, "
+            f"r2={train_log['r2']:.3f}±{train_log['r2_std']:.3f} | "
+            f"Val l1={val_log['l1']:.5f}, grad={val_log['grad']:.5f}, score={val_log['score']:.5f} | "
+            f"Val cx={val_log['cx']:.3f}±{val_log['cx_std']:.3f}, "
+            f"cy={val_log['cy']:.3f}±{val_log['cy_std']:.3f}, "
+            f"r1={val_log['r1']:.3f}±{val_log['r1_std']:.3f}, "
+            f"r2={val_log['r2']:.3f}±{val_log['r2_std']:.3f}"
         )
 
         if val_log["score"] < best_val_score:
@@ -341,7 +381,6 @@ def main():
 
     model.load_state_dict(best_state)
 
-    # 3) test
     summary_psnr, summary_ssim, summary_grad = evaluate_test(
         model=model,
         test_loader=test_loader,

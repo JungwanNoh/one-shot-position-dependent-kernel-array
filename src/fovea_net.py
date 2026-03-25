@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 from config import CFG
 
 
@@ -20,47 +22,88 @@ class ConvBlock(nn.Module):
         return self.net(x)
 
 
-class FoveaParamNet(nn.Module):
+def softmax_heatmap_to_center(logits: torch.Tensor, temp: float):
     """
-    Predict per-image foveated parameters:
-    cx, cy, r1, r2
+    logits: [B,1,H,W]
+    return:
+      heatmap_probs: [B,1,H,W]
+      cx, cy: [B]
+    """
+    b, _, h, w = logits.shape
+    flat = logits.view(b, -1) / temp
+    probs = F.softmax(flat, dim=1).view(b, 1, h, w)
+
+    yy = torch.linspace(0.0, 1.0, h, device=logits.device).view(1, 1, h, 1)
+    xx = torch.linspace(0.0, 1.0, w, device=logits.device).view(1, 1, 1, w)
+
+    cx = (probs * xx).sum(dim=(1, 2, 3))
+    cy = (probs * yy).sum(dim=(1, 2, 3))
+
+    return probs, cx, cy
+
+
+class FoveaHeatmapNet(nn.Module):
+    """
+    Predict:
+      - spatial heatmap for center
+      - scalar radii r1, r2 from bottleneck
     """
     def __init__(self, in_ch=1, base_ch=32):
         super().__init__()
-        self.enc1 = ConvBlock(in_ch, base_ch)
+
+        self.enc1 = ConvBlock(in_ch, base_ch)           # H, W
         self.pool1 = nn.MaxPool2d(2)
 
-        self.enc2 = ConvBlock(base_ch, base_ch * 2)
+        self.enc2 = ConvBlock(base_ch, base_ch * 2)     # H/2, W/2
         self.pool2 = nn.MaxPool2d(2)
 
-        self.enc3 = ConvBlock(base_ch * 2, base_ch * 4)
-        self.pool3 = nn.AdaptiveAvgPool2d(1)
+        self.bottleneck = ConvBlock(base_ch * 2, base_ch * 4)  # H/4, W/4
 
-        self.fc = nn.Sequential(
+        # decoder for heatmap
+        self.up1 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 2, stride=2)
+        self.dec1 = ConvBlock(base_ch * 4, base_ch * 2)
+
+        self.up2 = nn.ConvTranspose2d(base_ch * 2, base_ch, 2, stride=2)
+        self.dec2 = ConvBlock(base_ch * 2, base_ch)
+
+        self.heatmap_head = nn.Conv2d(base_ch, 1, kernel_size=1)
+
+        # radius head
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.radius_head = nn.Sequential(
             nn.Flatten(),
             nn.Linear(base_ch * 4, 64),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 4),
+            nn.Linear(64, 2),
         )
 
     def forward(self, x):
-        x = self.enc1(x)
-        x = self.pool1(x)
-        x = self.enc2(x)
-        x = self.pool2(x)
-        x = self.enc3(x)
-        x = self.pool3(x)
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        b = self.bottleneck(self.pool2(e2))
 
-        raw = self.fc(x)  # [B,4]
+        d1 = self.up1(b)
+        d1 = torch.cat([d1, e2], dim=1)
+        d1 = self.dec1(d1)
 
-        cx = torch.sigmoid(raw[:, 0])
-        cy = torch.sigmoid(raw[:, 1])
+        d2 = self.up2(d1)
+        d2 = torch.cat([d2, e1], dim=1)
+        d2 = self.dec2(d2)
 
-        r1 = CFG.R1_MIN + (CFG.R1_MAX - CFG.R1_MIN) * torch.sigmoid(raw[:, 2])
-        dr = CFG.DR_MIN + (CFG.DR_MAX - CFG.DR_MIN) * torch.sigmoid(raw[:, 3])
+        heatmap_logits = self.heatmap_head(d2)
+        heatmap_probs, cx, cy = softmax_heatmap_to_center(
+            heatmap_logits,
+            temp=CFG.HEATMAP_SOFTMAX_TEMP,
+        )
+
+        raw_radius = self.radius_head(self.gap(b))
+        r1 = CFG.R1_MIN + (CFG.R1_MAX - CFG.R1_MIN) * torch.sigmoid(raw_radius[:, 0])
+        dr = CFG.DR_MIN + (CFG.DR_MAX - CFG.DR_MIN) * torch.sigmoid(raw_radius[:, 1])
         r2 = r1 + dr
 
         return {
+            "heatmap_logits": heatmap_logits,
+            "heatmap_probs": heatmap_probs,
             "cx": cx,
             "cy": cy,
             "r1": r1,
@@ -69,10 +112,6 @@ class FoveaParamNet(nn.Module):
 
 
 def build_distance_map(h: int, w: int, cx: torch.Tensor, cy: torch.Tensor, device: str):
-    """
-    cx, cy: [B]
-    output: [B,1,H,W]
-    """
     yy = torch.linspace(0.0, 1.0, h, device=device).view(1, h, 1)
     xx = torch.linspace(0.0, 1.0, w, device=device).view(1, 1, w)
 
@@ -87,9 +126,6 @@ def build_distance_map(h: int, w: int, cx: torch.Tensor, cy: torch.Tensor, devic
 
 
 def params_to_soft_zones(params: dict, h: int, w: int, device: str):
-    """
-    zone order: 0=attention, 1=intermediate, 2=around
-    """
     dist = build_distance_map(h, w, params["cx"], params["cy"], device)
 
     r1 = params["r1"].view(-1, 1, 1, 1)
@@ -101,6 +137,7 @@ def params_to_soft_zones(params: dict, h: int, w: int, device: str):
 
     zone_probs = torch.cat([attn, inter, around], dim=1)
     zone_probs = zone_probs / (zone_probs.sum(dim=1, keepdim=True) + 1e-8)
+
     return zone_probs, dist
 
 
