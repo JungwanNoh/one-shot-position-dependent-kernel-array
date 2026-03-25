@@ -1,81 +1,277 @@
 import os
 import csv
 import time
-from pathlib import Path
+import copy
+from typing import Tuple, List
+
 import numpy as np
+from PIL import Image
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split, Dataset
+from torch.utils.data import DataLoader, Dataset
 
-from config import COMMON, CLASSIFICATION, DEVICE, SEED
-from utils import ensure_dir, set_seed
-from kernels import apply_global_torch, get_zone_kernel_bank_torch, apply_pdk_soft_torch
+from torchvision import datasets, transforms, models
 
+from config import CLASSIFICATION
+
+
+# ============================================================
+# Config helpers
+# ============================================================
+
+DATASET_NAME = CLASSIFICATION.get("dataset", "CIFAR10").upper()
+DATA_ROOT = CLASSIFICATION.get("data_root", "../dat/torchvision")
+TINY_IMAGENET_ROOT = CLASSIFICATION.get("tiny_imagenet_root", "../dat/tiny-imagenet-200")
+
+DEVICE = CLASSIFICATION.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = CLASSIFICATION.get("batch_size", 128)
+EPOCHS = CLASSIFICATION.get("epochs", 20)
+LR = CLASSIFICATION.get("lr", 1e-3)
+WEIGHT_DECAY = CLASSIFICATION.get("weight_decay", 1e-5)
+NUM_WORKERS = CLASSIFICATION.get("num_workers", 0)
+
+# Global / PDK settings
+GLOBAL_SIGMA = CLASSIFICATION.get("global_sigma", 0.7)
+KERNEL_SIZE = CLASSIFICATION.get("kernel_size", 3)
+
+# PDK kernel specs
+ZONE_KERNEL_SPECS = CLASSIFICATION.get(
+    "zone_kernel_specs",
+    {
+        0: {"family": "unsharp", "sigma": 0.5, "amount": 0.12},  # attention
+        1: {"family": "binomial"},                                # intermediate
+        2: {"family": "gaussian", "sigma": 0.9},                  # around
+    },
+)
+
+# Zone regularization
+TARGET_ZONE_RATIOS = CLASSIFICATION.get("target_zone_ratios", (0.15, 0.25, 0.60))
+LOSS_W_CE = CLASSIFICATION.get("loss_w_ce", 1.0)
+LOSS_W_RATIO = CLASSIFICATION.get("loss_w_ratio", 0.01)
+LOSS_W_ENTROPY = CLASSIFICATION.get("loss_w_entropy", 0.002)
+
+SAVE_ROOT = CLASSIFICATION.get("save_root", "../res/classification_compare")
+os.makedirs(SAVE_ROOT, exist_ok=True)
+
+
+# ============================================================
+# Utility
+# ============================================================
+
+def set_seed(seed: int) -> None:
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def get_device(preferred: str) -> str:
+    if preferred == "cuda" and torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+# ============================================================
+# Tiny ImageNet validation loader
+# ============================================================
 
 class TinyImageNetValDataset(Dataset):
-    """
-    Standard tiny-imagenet-200 val loader without requiring folder reshuffling.
-    Expects:
-      root/
-        train/<class>/images/*.JPEG
-        wnids.txt
-        val/images/*.JPEG
-        val/val_annotations.txt
-    """
     def __init__(self, root: str, transform=None):
-        self.root = Path(root)
+        self.root = root
         self.transform = transform
-        wnids = (self.root / "wnids.txt").read_text().strip().splitlines()
-        self.class_to_idx = {wnid: i for i, wnid in enumerate(wnids)}
 
-        ann_path = self.root / "val" / "val_annotations.txt"
-        img_dir = self.root / "val" / "images"
-        self.samples = []
-        with open(ann_path, "r", encoding="utf-8") as f:
+        wnids_path = os.path.join(root, "wnids.txt")
+        val_annot_path = os.path.join(root, "val", "val_annotations.txt")
+        val_img_dir = os.path.join(root, "val", "images")
+
+        with open(wnids_path, "r", encoding="utf-8") as f:
+            wnids = [line.strip() for line in f.readlines()]
+        self.class_to_idx = {wnid: idx for idx, wnid in enumerate(wnids)}
+
+        self.samples: List[Tuple[str, int]] = []
+        with open(val_annot_path, "r", encoding="utf-8") as f:
             for line in f:
-                toks = line.strip().split("\t")
-                fname, wnid = toks[0], toks[1]
-                self.samples.append((img_dir / fname, self.class_to_idx[wnid]))
+                parts = line.strip().split("\t")
+                if len(parts) < 2:
+                    continue
+                img_name, wnid = parts[0], parts[1]
+                img_path = os.path.join(val_img_dir, img_name)
+                label = self.class_to_idx[wnid]
+                self.samples.append((img_path, label))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        from PIL import Image
-        path, target = self.samples[idx]
+        path, label = self.samples[idx]
         img = Image.open(path).convert("RGB")
         if self.transform is not None:
             img = self.transform(img)
-        return img, target
+        return img, label
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
+# ============================================================
+# Data
+# ============================================================
 
-    def forward(self, x):
-        return self.net(x)
+def build_transforms(dataset_name: str):
+    if dataset_name == "CIFAR10":
+        image_size = 32
+    elif dataset_name == "STL10":
+        image_size = 96
+    elif dataset_name == "TINYIMAGENET":
+        image_size = 64
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+    train_tfm = transforms.Compose([
+        transforms.RandomCrop(image_size, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+    ])
+
+    test_tfm = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    return train_tfm, test_tfm
 
 
-class ZoneHeatmapHead(nn.Module):
+def build_loaders():
+    train_tfm, test_tfm = build_transforms(DATASET_NAME)
+
+    if DATASET_NAME == "CIFAR10":
+        train_ds = datasets.CIFAR10(root=DATA_ROOT, train=True, download=True, transform=train_tfm)
+        test_ds = datasets.CIFAR10(root=DATA_ROOT, train=False, download=True, transform=test_tfm)
+        num_classes = 10
+
+    elif DATASET_NAME == "STL10":
+        train_ds = datasets.STL10(root=DATA_ROOT, split="train", download=True, transform=train_tfm)
+        test_ds = datasets.STL10(root=DATA_ROOT, split="test", download=True, transform=test_tfm)
+        num_classes = 10
+
+    elif DATASET_NAME == "TINYIMAGENET":
+        train_root = os.path.join(TINY_IMAGENET_ROOT, "train")
+        train_ds = datasets.ImageFolder(root=train_root, transform=train_tfm)
+        test_ds = TinyImageNetValDataset(root=TINY_IMAGENET_ROOT, transform=test_tfm)
+        num_classes = 200
+
+    else:
+        raise ValueError(f"Unsupported dataset: {DATASET_NAME}")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+    return train_loader, test_loader, num_classes
+
+
+# ============================================================
+# Kernels
+# ============================================================
+
+def identity_kernel_np(kernel_size: int) -> np.ndarray:
+    k = np.zeros((kernel_size, kernel_size), dtype=np.float32)
+    c = kernel_size // 2
+    k[c, c] = 1.0
+    return k
+
+
+def gaussian_kernel_np(kernel_size: int, sigma: float) -> np.ndarray:
+    ax = np.arange(-(kernel_size // 2), kernel_size // 2 + 1, dtype=np.float32)
+    xx, yy = np.meshgrid(ax, ax)
+    kernel = np.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2 + 1e-12))
+    kernel /= kernel.sum() + 1e-12
+    return kernel.astype(np.float32)
+
+
+def binomial_kernel_np(kernel_size: int) -> np.ndarray:
+    order = kernel_size - 1
+    vec = np.array([1.0], dtype=np.float32)
+    for _ in range(order):
+        vec = np.convolve(vec, np.array([1.0, 1.0], dtype=np.float32)).astype(np.float32)
+    kernel = np.outer(vec, vec)
+    kernel /= kernel.sum() + 1e-12
+    return kernel.astype(np.float32)
+
+
+def unsharp_kernel_np(kernel_size: int, sigma: float, amount: float) -> np.ndarray:
+    delta = identity_kernel_np(kernel_size)
+    blur = gaussian_kernel_np(kernel_size, sigma)
+    kernel = delta + amount * (delta - blur)
+    return kernel.astype(np.float32)
+
+
+def build_kernel_np(spec: dict, kernel_size: int) -> np.ndarray:
+    family = spec["family"]
+    if family == "gaussian":
+        return gaussian_kernel_np(kernel_size, float(spec["sigma"]))
+    if family == "binomial":
+        return binomial_kernel_np(kernel_size)
+    if family == "unsharp":
+        return unsharp_kernel_np(kernel_size, float(spec["sigma"]), float(spec["amount"]))
+    raise ValueError(f"Unknown kernel family: {family}")
+
+
+def kernel_bank_torch(zone_specs: dict, in_channels: int, device: str):
+    bank = []
+    for zone_id in [0, 1, 2]:
+        k = build_kernel_np(zone_specs[zone_id], KERNEL_SIZE)
+        k = torch.tensor(k, dtype=torch.float32, device=device)[None, None, :, :]
+        k = k.repeat(in_channels, 1, 1, 1)  # depthwise
+        bank.append(k)
+    return bank
+
+
+def apply_global_gaussian_torch(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    c = x.shape[1]
+    k = gaussian_kernel_np(KERNEL_SIZE, sigma)
+    k = torch.tensor(k, dtype=torch.float32, device=x.device)[None, None, :, :].repeat(c, 1, 1, 1)
+    pad = KERNEL_SIZE // 2
+    out = F.conv2d(x, k, padding=pad, groups=c)
+    return out.clamp(0.0, 1.0)
+
+
+def apply_zonewise_pdk_soft_torch(x: torch.Tensor, zone_probs: torch.Tensor, bank) -> torch.Tensor:
+    pad = KERNEL_SIZE // 2
+
+    filtered = []
+    for k in bank:
+        filtered.append(F.conv2d(x, k, padding=pad, groups=x.shape[1]))
+    filtered = torch.stack(filtered, dim=1)  # [B,3,C,H,W]
+
+    zone_probs = zone_probs.unsqueeze(2)      # [B,3,1,H,W]
+    out = (filtered * zone_probs).sum(dim=1)
+    return out.clamp(0.0, 1.0)
+
+
+# ============================================================
+# Models
+# ============================================================
+
+class ZonePredictor(nn.Module):
+    """
+    Input: raw, global, |raw-global| -> 3-zone logits
+    """
     def __init__(self, in_ch=9, base=32):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, base, 3, padding=1),
-            nn.BatchNorm2d(base),
             nn.ReLU(inplace=True),
             nn.Conv2d(base, base, 3, padding=1),
-            nn.BatchNorm2d(base),
             nn.ReLU(inplace=True),
             nn.Conv2d(base, 3, 1),
         )
@@ -84,60 +280,27 @@ class ZoneHeatmapHead(nn.Module):
         return self.net(x)
 
 
-class ResNet18Classifier(nn.Module):
-    def __init__(self, num_classes=10):
-        super().__init__()
-        from torchvision.models import resnet18
-        self.net = resnet18(weights=None, num_classes=num_classes)
+def build_classifier(num_classes: int, dataset_name: str):
+    model = models.shufflenet_v2_x0_5(weights=None)
 
-    def forward(self, x):
-        return self.net(x)
+    # Small-image friendly stem
+    if dataset_name.upper() in ["CIFAR10", "STL10", "TINYIMAGENET"]:
+        model.conv1[0] = nn.Conv2d(
+            3, 24, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        model.maxpool = nn.Identity()
 
-
-class RawModel(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        self.clf = ResNet18Classifier(num_classes)
-
-    def forward(self, x):
-        return self.clf(x), {}
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    return model
 
 
-class GlobalModel(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        self.clf = ResNet18Classifier(num_classes)
-        self.global_spec = COMMON["global_specs"]["classification"]
-        self.kernel_size = COMMON["kernel_size"]
-
-    def forward(self, x):
-        xg = apply_global_torch(x, self.global_spec, self.kernel_size)
-        return self.clf(xg), {}
-
-
-class PDKModel(nn.Module):
-    def __init__(self, num_classes, device):
-        super().__init__()
-        self.zone_head = ZoneHeatmapHead(in_ch=9, base=32)
-        self.clf = ResNet18Classifier(num_classes)
-        self.kernel_bank = get_zone_kernel_bank_torch(COMMON["zone_kernel_specs"], COMMON["kernel_size"], device)
-        self.global_spec = COMMON["global_specs"]["classification"]
-        self.kernel_size = COMMON["kernel_size"]
-
-    def forward(self, x):
-        xg = apply_global_torch(x, self.global_spec, self.kernel_size)
-        z_in = torch.cat([x, xg, torch.abs(x - xg)], dim=1)
-        zone_logits = self.zone_head(z_in)
-        zone_probs = F.softmax(zone_logits, dim=1)
-        xp = apply_pdk_soft_torch(x, zone_probs, self.kernel_bank)
-        logits = self.clf(xp)
-        aux = {"zone_probs": zone_probs}
-        return logits, aux
-
+# ============================================================
+# Losses
+# ============================================================
 
 def zone_ratio_loss(zone_probs):
     actual = zone_probs.mean(dim=(0, 2, 3))
-    target = torch.tensor(CLASSIFICATION["ratio_target"], device=zone_probs.device, dtype=zone_probs.dtype)
+    target = torch.tensor(TARGET_ZONE_RATIOS, dtype=zone_probs.dtype, device=zone_probs.device)
     return F.l1_loss(actual, target)
 
 
@@ -147,186 +310,306 @@ def entropy_loss(zone_probs):
     return ent
 
 
-def build_transforms(dataset_name: str):
-    from torchvision import transforms
-
-    use_ra = CLASSIFICATION["use_randaugment"]
-    ra = transforms.RandAugment(
-        num_ops=CLASSIFICATION["randaugment_num_ops"],
-        magnitude=CLASSIFICATION["randaugment_magnitude"],
-    ) if use_ra else None
-
-    name = dataset_name.upper()
-    if name == "CIFAR10":
-        train_ops = [transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip()]
-        if ra is not None:
-            train_ops.append(ra)
-        train_ops.append(transforms.ToTensor())
-        test_ops = [transforms.ToTensor()]
-    elif name == "STL10":
-        train_ops = [transforms.RandomCrop(96, padding=12), transforms.RandomHorizontalFlip()]
-        if ra is not None:
-            train_ops.append(ra)
-        train_ops.append(transforms.ToTensor())
-        test_ops = [transforms.ToTensor()]
-    elif name == "TINYIMAGENET":
-        train_ops = [transforms.RandomCrop(64, padding=8), transforms.RandomHorizontalFlip()]
-        if ra is not None:
-            train_ops.append(ra)
-        train_ops.append(transforms.ToTensor())
-        test_ops = [transforms.ToTensor()]
-    else:
-        raise ValueError(dataset_name)
-
-    return transforms.Compose(train_ops), transforms.Compose(test_ops)
-
-
-def build_dataloaders():
-    from torchvision import datasets
-
-    dataset_name = CLASSIFICATION["dataset"].upper()
-    tf_train, tf_test = build_transforms(dataset_name)
-
-    if dataset_name == "CIFAR10":
-        train_all = datasets.CIFAR10(root=CLASSIFICATION["data_root"], train=True, download=True, transform=tf_train)
-        test_ds = datasets.CIFAR10(root=CLASSIFICATION["data_root"], train=False, download=True, transform=tf_test)
-        num_classes = 10
-    elif dataset_name == "STL10":
-        train_all = datasets.STL10(root=CLASSIFICATION["data_root"], split="train", download=True, transform=tf_train)
-        test_ds = datasets.STL10(root=CLASSIFICATION["data_root"], split="test", download=True, transform=tf_test)
-        num_classes = 10
-    elif dataset_name == "TINYIMAGENET":
-        root = CLASSIFICATION["tiny_imagenet_root"]
-        train_all = datasets.ImageFolder(root=os.path.join(root, "train"), transform=tf_train)
-        test_ds = TinyImageNetValDataset(root=root, transform=tf_test)
-        num_classes = 200
-    else:
-        raise ValueError(CLASSIFICATION["dataset"])
-
-    val_len = max(1, int(0.1 * len(train_all)))
-    train_len = len(train_all) - val_len
-    train_ds, val_ds = random_split(train_all, [train_len, val_len], generator=torch.Generator().manual_seed(SEED))
-
-    train_loader = DataLoader(train_ds, batch_size=CLASSIFICATION["batch_size"], shuffle=True, num_workers=CLASSIFICATION["num_workers"], pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=CLASSIFICATION["batch_size"], shuffle=False, num_workers=CLASSIFICATION["num_workers"], pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=CLASSIFICATION["batch_size"], shuffle=False, num_workers=CLASSIFICATION["num_workers"], pin_memory=True)
-    return train_loader, val_loader, test_loader, num_classes
-
-
-def build_scheduler(optimizer):
-    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CLASSIFICATION["epochs"])
-
+# ============================================================
+# Evaluation
+# ============================================================
 
 @torch.no_grad()
-def evaluate(model, loader, device):
-    model.eval()
-    total, correct = 0, 0
-    start = time.time()
+def evaluate_classifier(
+    clf,
+    loader,
+    device,
+    preprocess_mode="raw",
+    zone_net=None,
+    kernel_bank=None,
+):
+    clf.eval()
+    if zone_net is not None:
+        zone_net.eval()
+
+    total = 0
+    correct = 0
+
+    t0 = time.time()
+
     for x, y in loader:
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        logits, _ = model(x)
-        pred = logits.argmax(dim=1)
+        x, y = x.to(device), y.to(device)
+
+        if preprocess_mode == "raw":
+            x_in = x
+
+        elif preprocess_mode == "global":
+            x_in = apply_global_gaussian_torch(x, GLOBAL_SIGMA)
+
+        elif preprocess_mode == "pdk":
+            global_x = apply_global_gaussian_torch(x, GLOBAL_SIGMA)
+            z_in = torch.cat([x, global_x, torch.abs(x - global_x)], dim=1)
+            zone_logits = zone_net(z_in)
+            zone_probs = F.softmax(zone_logits, dim=1)
+            x_in = apply_zonewise_pdk_soft_torch(x, zone_probs, kernel_bank)
+
+        else:
+            raise ValueError(f"Unknown preprocess_mode: {preprocess_mode}")
+
+        pred = clf(x_in).argmax(dim=1)
         total += y.numel()
         correct += (pred == y).sum().item()
-    return 100.0 * correct / total, time.time() - start
+
+    elapsed = time.time() - t0
+    return correct / total, elapsed
 
 
-def train_one_model(mode: str, device: str, num_classes: int, train_loader, val_loader, test_loader):
-    if mode == "raw":
-        model = RawModel(num_classes).to(device)
-    elif mode == "global":
-        model = GlobalModel(num_classes).to(device)
-    elif mode == "pdk":
-        model = PDKModel(num_classes, device).to(device)
-    else:
-        raise ValueError(mode)
+# ============================================================
+# Train loops
+# ============================================================
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=CLASSIFICATION["lr"], weight_decay=CLASSIFICATION["weight_decay"])
-    scheduler = build_scheduler(optimizer)
+def build_optimizer_and_scheduler(model_params):
+    optimizer = torch.optim.AdamW(
+        model_params,
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=EPOCHS,
+        eta_min=1e-6,
+    )
+    return optimizer, scheduler
 
+
+def train_raw_or_global(clf, train_loader, test_loader, device, preprocess_mode="raw"):
+    optimizer, scheduler = build_optimizer_and_scheduler(clf.parameters())
+
+    best_acc = 0.0
     best_state = None
-    best_val = -1.0
     logs = []
 
-    for epoch in range(1, CLASSIFICATION["epochs"] + 1):
-        model.train()
+    for epoch in range(1, EPOCHS + 1):
+        clf.train()
+        ce_vals = []
+
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+
+            if preprocess_mode == "raw":
+                x_in = x
+            elif preprocess_mode == "global":
+                x_in = apply_global_gaussian_torch(x, GLOBAL_SIGMA)
+            else:
+                raise ValueError("preprocess_mode must be raw or global")
+
+            optimizer.zero_grad()
+            logits = clf(x_in)
+            ce = F.cross_entropy(logits, y)
+            ce.backward()
+            optimizer.step()
+
+            ce_vals.append(float(ce.detach().cpu()))
+
+        scheduler.step()
+
+        acc, _ = evaluate_classifier(clf, test_loader, device, preprocess_mode=preprocess_mode)
+        if acc > best_acc:
+            best_acc = acc
+            best_state = copy.deepcopy(clf.state_dict())
+
+        logs.append({
+            "epoch": epoch,
+            "ce": float(np.mean(ce_vals)),
+            "test_acc": acc,
+            "best_acc": best_acc,
+        })
+
+        print(
+            f"[{preprocess_mode.upper()}] Epoch {epoch:03d} | "
+            f"CE={np.mean(ce_vals):.5f} | Test Acc={acc:.4f} | Best={best_acc:.4f}"
+        )
+
+    if best_state is not None:
+        clf.load_state_dict(best_state)
+
+    return best_acc, logs
+
+
+def train_pdk(clf, zone_net, train_loader, test_loader, device, kernel_bank):
+    optimizer, scheduler = build_optimizer_and_scheduler(
+        list(clf.parameters()) + list(zone_net.parameters())
+    )
+
+    best_acc = 0.0
+    best_clf_state = None
+    best_zone_state = None
+    logs = []
+
+    for epoch in range(1, EPOCHS + 1):
+        clf.train()
+        zone_net.train()
+
         ce_vals, ratio_vals, ent_vals = [], [], []
 
         for x, y in train_loader:
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            x, y = x.to(device), y.to(device)
+
+            global_x = apply_global_gaussian_torch(x, GLOBAL_SIGMA)
+            z_in = torch.cat([x, global_x, torch.abs(x - global_x)], dim=1)
+
             optimizer.zero_grad()
-            logits, aux = model(x)
+
+            zone_logits = zone_net(z_in)
+            zone_probs = F.softmax(zone_logits, dim=1)
+            pdk_x = apply_zonewise_pdk_soft_torch(x, zone_probs, kernel_bank)
+
+            logits = clf(pdk_x)
+
             ce = F.cross_entropy(logits, y)
-            ratio = torch.tensor(0.0, device=device)
-            ent = torch.tensor(0.0, device=device)
-            if mode == "pdk":
-                ratio = zone_ratio_loss(aux["zone_probs"])
-                ent = entropy_loss(aux["zone_probs"])
-            loss = ce + CLASSIFICATION["loss_w_ratio"] * ratio + CLASSIFICATION["loss_w_entropy"] * ent
+            ratio = zone_ratio_loss(zone_probs)
+            ent = entropy_loss(zone_probs)
+
+            loss = (
+                LOSS_W_CE * ce
+                + LOSS_W_RATIO * ratio
+                + LOSS_W_ENTROPY * ent
+            )
             loss.backward()
             optimizer.step()
+
             ce_vals.append(float(ce.detach().cpu()))
             ratio_vals.append(float(ratio.detach().cpu()))
             ent_vals.append(float(ent.detach().cpu()))
 
         scheduler.step()
-        val_acc, _ = evaluate(model, val_loader, device)
-        test_acc, _ = evaluate(model, test_loader, device)
-        if val_acc > best_val:
-            best_val = val_acc
-            best_state = copy.deepcopy(model.state_dict())
+
+        acc, _ = evaluate_classifier(
+            clf, test_loader, device,
+            preprocess_mode="pdk",
+            zone_net=zone_net,
+            kernel_bank=kernel_bank,
+        )
+
+        if acc > best_acc:
+            best_acc = acc
+            best_clf_state = copy.deepcopy(clf.state_dict())
+            best_zone_state = copy.deepcopy(zone_net.state_dict())
 
         logs.append({
             "epoch": epoch,
             "ce": float(np.mean(ce_vals)),
             "ratio": float(np.mean(ratio_vals)),
             "entropy": float(np.mean(ent_vals)),
-            "val_acc": val_acc,
-            "test_acc": test_acc,
+            "test_acc": acc,
+            "best_acc": best_acc,
         })
 
         print(
-            f"[{mode.upper()}] Epoch {epoch:03d} | CE={np.mean(ce_vals):.5f}, ratio={np.mean(ratio_vals):.5f}, entropy={np.mean(ent_vals):.5f} | Val={val_acc:.3f} | Test={test_acc:.3f}"
+            f"[PDK] Epoch {epoch:03d} | "
+            f"CE={np.mean(ce_vals):.5f}, ratio={np.mean(ratio_vals):.5f}, entropy={np.mean(ent_vals):.5f} | "
+            f"Test Acc={acc:.4f} | Best={best_acc:.4f}"
         )
 
-    model.load_state_dict(best_state)
-    final_test_acc, eval_time = evaluate(model, test_loader, device)
-    return final_test_acc, eval_time, logs
+    if best_clf_state is not None:
+        clf.load_state_dict(best_clf_state)
+    if best_zone_state is not None:
+        zone_net.load_state_dict(best_zone_state)
+
+    return best_acc, logs
 
 
-def run_classification():
-    save_root = CLASSIFICATION["save_dir"]
-    ensure_dir(save_root)
-    set_seed(SEED)
+# ============================================================
+# Main
+# ============================================================
 
-    device = DEVICE if (DEVICE == "cuda" and torch.cuda.is_available()) else "cpu"
-    train_loader, val_loader, test_loader, num_classes = build_dataloaders()
+def run():
+    device = get_device(DEVICE)
+    train_loader, test_loader, num_classes = build_loaders()
 
-    summary_rows = []
-    all_logs = {}
+    # -----------------------------
+    # RAW
+    # -----------------------------
+    raw_clf = build_classifier(num_classes, DATASET_NAME).to(device)
+    raw_best_acc, raw_logs = train_raw_or_global(
+        raw_clf, train_loader, test_loader, device, preprocess_mode="raw"
+    )
+    raw_final_acc, raw_eval_time = evaluate_classifier(
+        raw_clf, test_loader, device, preprocess_mode="raw"
+    )
 
-    for mode in ["raw", "global", "pdk"]:
-        test_acc, eval_time, logs = train_one_model(mode, device, num_classes, train_loader, val_loader, test_loader)
-        all_logs[mode] = logs
-        summary_rows.append({
-            "method": mode.capitalize() if mode != "pdk" else "PDK",
-            "dataset": CLASSIFICATION["dataset"],
-            "test_acc": test_acc,
-            "eval_time_sec": eval_time,
-        })
+    # -----------------------------
+    # GLOBAL
+    # -----------------------------
+    global_clf = build_classifier(num_classes, DATASET_NAME).to(device)
+    global_best_acc, global_logs = train_raw_or_global(
+        global_clf, train_loader, test_loader, device, preprocess_mode="global"
+    )
+    global_final_acc, global_eval_time = evaluate_classifier(
+        global_clf, test_loader, device, preprocess_mode="global"
+    )
 
-    with open(os.path.join(save_root, f"classification_summary_{CLASSIFICATION['dataset'].lower()}.csv"), "w", newline="", encoding="utf-8") as f:
+    # -----------------------------
+    # PDK
+    # -----------------------------
+    pdk_clf = build_classifier(num_classes, DATASET_NAME).to(device)
+    zone_net = ZonePredictor(in_ch=9, base=32).to(device)
+    kernel_bank = kernel_bank_torch(ZONE_KERNEL_SPECS, in_channels=3, device=device)
+
+    pdk_best_acc, pdk_logs = train_pdk(
+        pdk_clf, zone_net, train_loader, test_loader, device, kernel_bank
+    )
+    pdk_final_acc, pdk_eval_time = evaluate_classifier(
+        pdk_clf, test_loader, device,
+        preprocess_mode="pdk",
+        zone_net=zone_net,
+        kernel_bank=kernel_bank,
+    )
+
+    # -----------------------------
+    # Save logs
+    # -----------------------------
+    with open(os.path.join(SAVE_ROOT, f"{DATASET_NAME.lower()}_raw_log.csv"), "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(raw_logs[0].keys()))
+        writer.writeheader()
+        writer.writerows(raw_logs)
+
+    with open(os.path.join(SAVE_ROOT, f"{DATASET_NAME.lower()}_global_log.csv"), "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(global_logs[0].keys()))
+        writer.writeheader()
+        writer.writerows(global_logs)
+
+    with open(os.path.join(SAVE_ROOT, f"{DATASET_NAME.lower()}_pdk_log.csv"), "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(pdk_logs[0].keys()))
+        writer.writeheader()
+        writer.writerows(pdk_logs)
+
+    summary_rows = [
+        {
+            "method": "Raw",
+            "best_acc": raw_best_acc,
+            "final_acc": raw_final_acc,
+            "eval_time_sec": raw_eval_time,
+        },
+        {
+            "method": "Global",
+            "best_acc": global_best_acc,
+            "final_acc": global_final_acc,
+            "eval_time_sec": global_eval_time,
+        },
+        {
+            "method": "PDK",
+            "best_acc": pdk_best_acc,
+            "final_acc": pdk_final_acc,
+            "eval_time_sec": pdk_eval_time,
+        },
+    ]
+
+    with open(os.path.join(SAVE_ROOT, f"{DATASET_NAME.lower()}_classification_summary.csv"), "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(summary_rows[0].keys()))
         writer.writeheader()
         writer.writerows(summary_rows)
 
-    # Save per-method learning logs
-    for mode, logs in all_logs.items():
-        with open(os.path.join(save_root, f"{mode}_log_{CLASSIFICATION['dataset'].lower()}.csv"), "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(logs[0].keys()))
-            writer.writeheader()
-            writer.writerows(logs)
-
     print("\n=== Classification Comparison ===")
     for row in summary_rows:
-        print(f"{row['method']}: test_acc={row['test_acc']:.3f}, eval_time={row['eval_time_sec']:.3f}s")
+        print(
+            f"{row['method']}: "
+            f"best_acc={row['best_acc']:.4f}, "
+            f"final_acc={row['final_acc']:.4f}, "
+            f"eval_time={row['eval_time_sec']:.3f}s"
+        )
