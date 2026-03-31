@@ -2,7 +2,7 @@ import os
 
 SEED = 42
 FILE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp')
-SAVE_ROOT = '../res/01_glovalvspdk_test'
+SAVE_ROOT = '../res/02_onlyedge_classificationupgrade'
 KERNEL_SIZE = 3
 
 # Zone id semantics used across all tasks.
@@ -77,16 +77,18 @@ NATURAL = {
 
 CLASSIFICATION = {
     # Dataset: 'TINYIMAGENET' | 'CIFAR10' | 'STL10'
-    'dataset': 'TINYIMAGENET',
+    'dataset': 'CIFAR10',
     'data_root': '../dat/torchvision',
     'tiny_imagenet_root': '../dat/tiny-imagenet-200',
     'save_dir': os.path.join(SAVE_ROOT, 'classification'),
     'batch_size': 128,
-    'epochs': 10,
+    'epochs': 30,
     'lr': 3e-4,
     'weight_decay': 1e-4,
     'num_workers': 0,
-    'backbone': 'shufflenet',         # shufflenet_v2_x0_5 (lightweight)
+    'backbone': 'shufflenet',         # shufflenet_v2_x0_5 (ImageNet pretrained for TinyImageNet)
+    'input_size': 224,
+    'use_imagenet_pretrained': True,
     # Global kernel applied before classification
     'global_sigma': 0.7,
     # PDK zone kernels (same semantic as image tasks)

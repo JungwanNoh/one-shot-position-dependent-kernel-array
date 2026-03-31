@@ -15,7 +15,7 @@ from kernels import (
 from zone_generators import (
     lowlight_scores_np,
     assign_zones_from_scores,
-    edge_gain_lowlight,
+    edge_response_lowlight,
 )
 from metrics import edge_l1, edge_corr, mean_abs_change, psnr, ssim
 from visualize import save_image, save_zone_map, save_panel_3x3, save_barplot
@@ -24,7 +24,7 @@ from visualize import save_image, save_zone_map, save_panel_3x3, save_barplot
 def _print_guide():
     print('\n=== Lowlight Task ===')
     print('Goal: make object-relevant low-light contours more visible while suppressing noisy background regions.')
-    print('Top-row panels show Raw image plus Global/PDK edge-gain maps relative to Raw.')
+    print('Top-row panels show Raw image plus Global/PDK edge-response maps extracted from each processed image.')
     print('PDK rule: preserve already-visible contours, recover global-missed edge candidates, suppress dark noisy regions.')
     print(f"Global baseline kernel: {format_kernel_spec(GLOBAL_KERNEL_SPECS['lowlight'])}")
     print(f"PDK zone kernels     : {format_zone_kernel_specs('lowlight')}")
@@ -65,8 +65,8 @@ def run():
         zone = assign_zones_from_scores(preserve, recover, suppress)
         pdk_out = apply_zonewise_pdk_np(raw, zone, 'lowlight')
 
-        global_panel = edge_gain_lowlight(raw, global_out)
-        pdk_panel = edge_gain_lowlight(raw, pdk_out)
+        global_panel = edge_response_lowlight(global_out)
+        pdk_panel = edge_response_lowlight(pdk_out)
 
         raw_e_l1 = edge_l1(raw, gt)
         global_e_l1 = edge_l1(global_out, gt)

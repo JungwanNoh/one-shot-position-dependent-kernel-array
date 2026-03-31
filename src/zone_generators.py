@@ -115,21 +115,16 @@ def edge_strength_natural(img: np.ndarray) -> np.ndarray:
     return normalize01(weighted)
 
 
-def edge_gain_map(raw_edge: np.ndarray, processed_edge: np.ndarray) -> np.ndarray:
-    gain = np.maximum(processed_edge - raw_edge, 0.0).astype(np.float32)
-    return normalize01(gain)
+def edge_response_synthetic(processed: np.ndarray) -> np.ndarray:
+    return edge_strength_synthetic(processed)
 
 
-def edge_gain_synthetic(raw: np.ndarray, processed: np.ndarray) -> np.ndarray:
-    return edge_gain_map(edge_strength_synthetic(raw), edge_strength_synthetic(processed))
+def edge_response_lowlight(processed: np.ndarray) -> np.ndarray:
+    return edge_strength_lowlight(processed)
 
 
-def edge_gain_lowlight(raw: np.ndarray, processed: np.ndarray) -> np.ndarray:
-    return edge_gain_map(edge_strength_lowlight(raw), edge_strength_lowlight(processed))
-
-
-def edge_gain_natural(raw: np.ndarray, processed: np.ndarray) -> np.ndarray:
-    return edge_gain_map(edge_strength_natural(raw), edge_strength_natural(processed))
+def edge_response_natural(processed: np.ndarray) -> np.ndarray:
+    return edge_strength_natural(processed)
 
 
 def target_edge_map(img: np.ndarray) -> np.ndarray:

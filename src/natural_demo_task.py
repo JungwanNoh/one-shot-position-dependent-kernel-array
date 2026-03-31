@@ -12,7 +12,7 @@ from kernels import (
     get_global_kernel_matrix,
     get_zone_kernel_matrices,
 )
-from zone_generators import natural_scores_np, assign_zones_from_scores, edge_gain_natural
+from zone_generators import natural_scores_np, assign_zones_from_scores, edge_response_natural
 from metrics import mean_abs_change
 from visualize import save_image, save_zone_map, save_panel_3x3, save_barplot
 
@@ -20,7 +20,7 @@ from visualize import save_image, save_zone_map, save_panel_3x3, save_barplot
 def _print_guide():
     print('\n=== Natural Task ===')
     print('Goal: make object-relevant contours more visible for recognition-oriented preprocessing.')
-    print('Top-row panels show Raw image plus Global/PDK edge-gain maps relative to Raw.')
+    print('Top-row panels show Raw image plus Global/PDK edge-response maps extracted from each processed image.')
     print('PDK rule: preserve stable contours, recover global-missed contour candidates, suppress clutter/background refinement.')
     print(f"Global baseline kernel: {format_kernel_spec(GLOBAL_KERNEL_SPECS['natural'])}")
     print(f"PDK zone kernels     : {format_zone_kernel_specs('natural')}")
@@ -51,8 +51,8 @@ def run():
         zone = assign_zones_from_scores(preserve, recover, suppress)
         pdk_out = apply_zonewise_pdk_np(raw, zone, 'natural')
 
-        global_panel = edge_gain_natural(raw, global_out)
-        pdk_panel = edge_gain_natural(raw, pdk_out)
+        global_panel = edge_response_natural(global_out)
+        pdk_panel = edge_response_natural(pdk_out)
         mean_global_change = mean_abs_change(global_out, raw)
         mean_pdk_change = mean_abs_change(pdk_out, raw)
         rows.append({

@@ -17,7 +17,7 @@ from zone_generators import (
     random_field_map,
     synthetic_scores_np,
     assign_zones_from_scores,
-    edge_gain_synthetic,
+    edge_response_synthetic,
 )
 from metrics import edge_l1, edge_corr, mean_abs_change, psnr, ssim
 from visualize import save_image, save_zone_map, save_panel_3x3, save_barplot
@@ -26,7 +26,7 @@ from visualize import save_image, save_zone_map, save_panel_3x3, save_barplot
 def _print_guide():
     print('\n=== Synthetic Task ===')
     print('Goal: structural feature extraction under spatially mixed corruption.')
-    print('Top-row panels show Raw image plus Global/PDK edge-gain maps relative to Raw.')
+    print('Top-row panels show Raw image plus Global/PDK edge-response maps extracted from each processed image.')
     print('PDK rule: preserve already-kept edges, recover edges weakened by global, suppress non-edge regions.')
     print(f"Global baseline kernel: {format_kernel_spec(GLOBAL_KERNEL_SPECS['synthetic'])}")
     print(f"PDK zone kernels     : {format_zone_kernel_specs('synthetic')}")
@@ -69,8 +69,8 @@ def run():
         zone = assign_zones_from_scores(preserve, recover, suppress)
         pdk_out = apply_zonewise_pdk_np(raw, zone, 'synthetic')
 
-        global_panel = edge_gain_synthetic(raw, global_out)
-        pdk_panel = edge_gain_synthetic(raw, pdk_out)
+        global_panel = edge_response_synthetic(global_out)
+        pdk_panel = edge_response_synthetic(pdk_out)
 
         raw_e_l1 = edge_l1(raw, clean)
         global_e_l1 = edge_l1(global_out, clean)
